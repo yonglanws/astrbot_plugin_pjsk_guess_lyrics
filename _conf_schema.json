@@ -1,0 +1,53 @@
+{
+  "answer_timeout": {
+    "description": "答题时长（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "设置玩家回答问题的超时时间，单位为秒"
+  },
+  "daily_play_limit": {
+    "description": "每位玩家每日可参与游戏的次数上限（-1表示无限制）",
+    "type": "int",
+    "default": 10,
+    "hint": "设置每个用户每天可以玩几次游戏。设置为-1表示无限制"
+  },
+  "super_users": {
+    "description": "管理员用户ID列表",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "在此处添加管理员的用户ID（字符串形式），他们将有权限使用管理员指令"
+  },
+  "blacklist": {
+    "description": "黑名单用户ID列表",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "在此处添加被拉黑用户的ID（字符串形式），这些用户将无法使用插件功能"
+  },
+  "group_whitelist": {
+    "description": "群聊白名单",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "在此处添加允许使用此插件的群聊ID。如果列表为空，则所有群聊都允许使用"
+  },
+  "game_cooldown_seconds": {
+    "description": "游戏冷却时间（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "游戏结束后需要等待的时间才能开始下一局"
+  },
+  "ranking_display_count": {
+    "description": "排行榜显示的人数",
+    "type": "int",
+    "default": 10,
+    "hint": "设置排行榜要显示的玩家数量，建议范围：5-20"
+  }
+}
