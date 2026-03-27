@@ -1498,14 +1498,20 @@ class GuessLyricsPlugin(Star):
                 Comp.Image(file=options_img_path)
             ])
             
+            answered_user_id = None
+            answered_user_name = None
+            
             @session_waiter(timeout=timeout_seconds)
             async def answer_waiter(controller: SessionController, answer_event: AstrMessageEvent):
+                nonlocal answered_user_id, answered_user_name
                 answer_text = answer_event.message_str.strip()
                 if answer_text.isdigit():
                     try:
                         selected_num = int(answer_text)
                         if 1 <= selected_num <= 10:
                             game_session.answer_index = selected_num
+                            answered_user_id = answer_event.get_sender_id()
+                            answered_user_name = answer_event.get_sender_name()
                             controller.stop()
                     except ValueError:
                         pass
@@ -1520,12 +1526,15 @@ class GuessLyricsPlugin(Star):
             correct_name = self.song_manager.get_display_name(game_session.game_data.correct_song)
             correct_index = game_session.game_data.correct_index + 1
             
+            result_user_id = answered_user_id if answered_user_id else user_id
+            result_user_name = answered_user_name if answered_user_name else event.get_sender_name()
+            
             if game_session.answer_index is None:
                 result_text = f"⏰ 时间到！正确答案是 [{correct_index}] {correct_name}"
                 self.db.update_user_game_result(user_id, event.get_sender_name(), 0, correct=False)
             elif game_session.answer_index == correct_index:
-                result_text = f"🎉 {event.get_sender_name()}答对了！获得1分！\n正确答案是 [{correct_index}] {correct_name}"
-                self.db.update_user_game_result(user_id, event.get_sender_name(), 1, correct=True)
+                result_text = f"🎉 {result_user_name}答对了！获得1分！\n正确答案是 [{correct_index}] {correct_name}"
+                self.db.update_user_game_result(result_user_id, result_user_name, 1, correct=True)
             else:
                 result_text = f"❌ 回答错误！正确答案是 [{correct_index}] {correct_name}"
                 self.db.update_user_game_result(user_id, event.get_sender_name(), 0, correct=False)
