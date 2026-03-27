@@ -4,18 +4,16 @@ import random
 import time
 import os
 import sqlite3
-import re
 import urllib.request
 import io
-import hashlib
-from datetime import datetime, timedelta
-from contextlib import contextmanager, closing
-from dataclasses import dataclass, field
+from datetime import datetime
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Generator, Tuple, Set
-from functools import wraps
+from typing import Optional, List, Dict, Generator, Tuple
+from collections import OrderedDict
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont
 
 from astrbot.api import logger
 
@@ -88,6 +86,21 @@ class GameSession:
     game_ended_by_timeout: bool = False
 
 
+class LRUDict(OrderedDict):
+    """LRU缓存字典，防止内存无限增长"""
+    
+    def __init__(self, max_size: int = 500):
+        super().__init__()
+        self.max_size = max_size
+    
+    def __setitem__(self, key, value):
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        if len(self) > self.max_size:
+            self.popitem(last=False)
+
+
 class Config:
     """配置常量"""
     DEFAULT_OPTION_COUNT = 10
@@ -98,6 +111,8 @@ class Config:
     CLEANUP_INTERVAL = 3600
     MAX_AGE_SECONDS = 3600
     LYRICS_LINES_COUNT = 20
+    MAX_CUSTOM_NAME_LENGTH = 20
+    MAX_SESSION_CACHE_SIZE = 500
     
     class Image:
         MAX_WIDTH = 800
@@ -191,8 +206,12 @@ class CloudJacketLoader:
             if cache_file.exists():
                 try:
                     return Image.open(cache_file)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to load cached image {cache_file}: {e}")
+                    try:
+                        cache_file.unlink()
+                    except Exception:
+                        pass
         
         url = self.get_jacket_url(music_id)
         if not url:
@@ -208,8 +227,8 @@ class CloudJacketLoader:
                     try:
                         cache_file = self.cache_dir / f"{music_id}.png"
                         img.save(cache_file)
-                    except Exception:
-                        pass
+                    except Exception as save_error:
+                        logger.warning(f"Failed to cache jacket image: {save_error}")
                 
                 return img
         except Exception as e:
@@ -814,22 +833,24 @@ class ImageGenerator:
     def _paste_cover_in_card(self, img: Image.Image, cover_path: str, card_x: int, card_y: int, grid):
         """在卡片内粘贴封面图片（大封面）"""
         try:
-            if Path(cover_path).exists():
-                cover_img = Image.open(cover_path)
-                cover_img = cover_img.resize((grid.COVER_SIZE, grid.COVER_SIZE), LANCZOS)
-                
-                cover_x = card_x + grid.CARD_WIDTH - grid.COVER_SIZE - grid.CARD_PADDING
-                cover_y = card_y + (grid.CARD_HEIGHT - grid.COVER_SIZE) // 2
-                
-                mask = Image.new('L', (grid.COVER_SIZE, grid.COVER_SIZE), 0)
-                mask_draw = ImageDraw.Draw(mask)
-                mask_draw.rounded_rectangle([0, 0, grid.COVER_SIZE, grid.COVER_SIZE], radius=10, fill=255)
-                
-                output = Image.new('RGBA', cover_img.size, (0, 0, 0, 0))
-                output.paste(cover_img, (0, 0))
-                output.putalpha(mask)
-                
-                img.paste(output, (cover_x, cover_y), output)
+            path = Path(cover_path)
+            if not path.exists():
+                return
+            cover_img = Image.open(path)
+            cover_img = cover_img.resize((grid.COVER_SIZE, grid.COVER_SIZE), LANCZOS)
+            
+            cover_x = card_x + grid.CARD_WIDTH - grid.COVER_SIZE - grid.CARD_PADDING
+            cover_y = card_y + (grid.CARD_HEIGHT - grid.COVER_SIZE) // 2
+            
+            mask = Image.new('L', (grid.COVER_SIZE, grid.COVER_SIZE), 0)
+            mask_draw = ImageDraw.Draw(mask)
+            mask_draw.rounded_rectangle([0, 0, grid.COVER_SIZE, grid.COVER_SIZE], radius=10, fill=255)
+            
+            output = Image.new('RGBA', cover_img.size, (0, 0, 0, 0))
+            output.paste(cover_img, (0, 0))
+            output.putalpha(mask)
+            
+            img.paste(output, (cover_x, cover_y), output)
         except Exception as e:
             logger.warning(f"Failed to load cover: {e}")
     
@@ -847,28 +868,20 @@ class ImageGenerator:
     def create_ranking_image(self, rows: List[Tuple], output_dir: Path) -> Optional[str]:
         """渲染排行榜图片（精美卡片式设计，白色色调）"""
         try:
-            # 配置参数 - 优化布局，数据项右对齐
             width = 720
             card_width = 680
             card_height = 100
             card_gap = 16
             header_height = 130
             footer_height = 50
-            padding_x = 20
             
-            # 计算总高度
             height = header_height + len(rows) * (card_height + card_gap) + footer_height
             
-            # 创建白色背景
             img = Image.new("RGB", (width, height), (255, 255, 255))
             draw = ImageDraw.Draw(img)
             
-            # 添加轻微渐变背景
-            for y in range(height):
-                gray_val = 252 - int(8 * y / height)
-                draw.line([(0, y), (width, y)], fill=(gray_val, gray_val, gray_val + 2))
+            self._draw_gradient_background(draw, width, height)
             
-            # 颜色配置
             title_color = (50, 50, 70)
             subtitle_color = (120, 120, 140)
             card_bg = (255, 255, 255)
@@ -877,49 +890,44 @@ class ImageGenerator:
             text_gray = (100, 100, 120)
             score_color = (255, 140, 0)
             accuracy_color = (0, 150, 136)
-            attempts_color = (100, 149, 237)  # 总次数颜色
+            attempts_color = (100, 149, 237)
             
-            # 奖牌颜色
             medal_colors = [
-                (255, 193, 7),    # 金色
-                (192, 192, 192),  # 银色
-                (205, 127, 50)    # 铜色
+                (255, 193, 7),
+                (192, 192, 192),
+                (205, 127, 50)
             ]
             
-            # 绘制标题
             title_text = "歌词猜曲排行榜"
             title_width = self._get_text_width(draw, title_text, self.title_font)
             draw.text(((width - title_width) // 2, 40), title_text, font=self.title_font, fill=title_color)
             
-            # 绘制副标题
             subtitle = f"共 {len(rows)} 位玩家"
             subtitle_width = self._get_text_width(draw, subtitle, self.small_font)
             draw.text(((width - subtitle_width) // 2, 95), subtitle, font=self.small_font, fill=subtitle_color)
             
-            # 绘制排行榜项
             current_y = header_height
             
-            # 计算卡片水平位置（所有卡片共用）
             card_x = (width - card_width) // 2
             
-            # 数据项右对齐的基准位置
-            data_right_edge = card_x + card_width - 30  # 卡片右边缘留30px边距
+            data_area_right_edge = card_x + card_width - 30
+            
+            fixed_attempts_right = data_area_right_edge
+            fixed_acc_center = card_x + card_width - 180
+            fixed_score_left = card_x + card_width - 290
             
             for i, row in enumerate(rows):
                 user_id, user_name, custom_name, score, attempts, correct_attempts = row
                 display_name = custom_name if custom_name else user_name
                 accuracy = f"{(correct_attempts * 100 / attempts if attempts > 0 else 0):.1f}%"
                 
-                # 绘制卡片背景（圆角矩形）
                 self._draw_rounded_rect(draw, card_x, current_y, card_x + card_width, current_y + card_height, 14, card_bg, card_border)
                 
-                # 排名区域 - 使用圆形背景
                 rank_circle_x = card_x + 35
                 rank_circle_y = current_y + card_height // 2
                 circle_radius = 22
                 
                 if i < 3:
-                    # 前三名使用奖牌颜色背景
                     draw.ellipse([rank_circle_x - circle_radius, rank_circle_y - circle_radius,
                                   rank_circle_x + circle_radius, rank_circle_y + circle_radius],
                                  fill=medal_colors[i])
@@ -928,7 +936,6 @@ class ImageGenerator:
                     draw.text((rank_circle_x - rank_text_width // 2, rank_circle_y - 15),
                               rank_text, font=self.option_font, fill=(255, 255, 255))
                 else:
-                    # 其他名次使用灰色背景
                     draw.ellipse([rank_circle_x - circle_radius, rank_circle_y - circle_radius,
                                   rank_circle_x + circle_radius, rank_circle_y + circle_radius],
                                  fill=(220, 220, 230))
@@ -937,55 +944,43 @@ class ImageGenerator:
                     draw.text((rank_circle_x - rank_text_width // 2, rank_circle_y - 15),
                               rank_text, font=self.option_font, fill=text_dark)
                 
-                # 玩家名称 - 大幅增大显示区域
                 name_x = card_x + 85
                 name_y = current_y + 22
-                name_display = str(display_name)[:20]  # 增加到20个字符
+                name_display = str(display_name)[:20]
                 name_width = self._get_text_width(draw, name_display, self.option_font)
-                if name_width > 240:  # 增大宽度限制
+                if name_width > 240:
                     name_display = self._truncate_text(draw, name_display, self.option_font, 230) + "..."
                 draw.text((name_x, name_y), name_display, font=self.option_font, fill=text_dark)
                 
-                # 玩家ID
                 draw.text((name_x, name_y + 32), f"ID: {user_id}", font=self.small_font, fill=text_gray)
                 
-                # 数据项右对齐 - 从右向左排列
-                
-                # 总次数区域（最右侧）
                 attempts_str = str(attempts)
                 attempts_label = "次"
                 attempts_str_width = self._get_text_width(draw, attempts_str, self.card_title_font)
                 attempts_label_width = self._get_text_width(draw, attempts_label, self.small_font)
-                attempts_total_width = attempts_str_width + 5 + attempts_label_width
-                attempts_x = data_right_edge - attempts_total_width
+                attempts_x = fixed_attempts_right - attempts_str_width - 5 - attempts_label_width
                 attempts_y = current_y + 28
                 draw.text((attempts_x, attempts_y), attempts_str, font=self.card_title_font, fill=attempts_color)
                 draw.text((attempts_x + attempts_str_width + 5, attempts_y + 6), attempts_label, font=self.small_font, fill=text_gray)
                 
-                # 正确率区域
                 acc_label = "正确率"
                 acc_str_width = self._get_text_width(draw, accuracy, self.card_title_font)
                 acc_label_width = self._get_text_width(draw, acc_label, self.small_font)
-                acc_total_width = acc_str_width
-                acc_x = attempts_x - 100  # 与总次数保持间距（增大到100px）
+                acc_x = fixed_acc_center - acc_str_width // 2
                 acc_y = current_y + 28
                 draw.text((acc_x, acc_y), accuracy, font=self.card_title_font, fill=accuracy_color)
-                draw.text((acc_x + (acc_str_width - acc_label_width) // 2, acc_y + 30), acc_label, font=self.small_font, fill=text_gray)
+                draw.text((fixed_acc_center - acc_label_width // 2, acc_y + 30), acc_label, font=self.small_font, fill=text_gray)
                 
-                # 分数区域（最左侧）
                 score_str = str(score)
                 score_label = "分"
                 score_str_width = self._get_text_width(draw, score_str, self.card_title_font)
-                score_label_width = self._get_text_width(draw, score_label, self.small_font)
-                score_total_width = score_str_width + 5 + score_label_width
-                score_x = acc_x - 110  # 与正确率保持间距（增大到110px）
+                score_x = fixed_score_left
                 score_y = current_y + 28
                 draw.text((score_x, score_y), score_str, font=self.card_title_font, fill=score_color)
                 draw.text((score_x + score_str_width + 5, score_y + 6), score_label, font=self.small_font, fill=text_gray)
                 
                 current_y += card_height + card_gap
             
-            # 绘制页脚
             footer_text = f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             footer_width = self._get_text_width(draw, footer_text, self.small_font)
             draw.text(((width - footer_width) // 2, height - 30), footer_text, font=self.small_font, fill=(180, 180, 190))
@@ -998,6 +993,17 @@ class ImageGenerator:
         except Exception as e:
             logger.error(f"渲染排行榜图片失败: {e}", exc_info=True)
             return None
+    
+    def _draw_gradient_background(self, draw: ImageDraw.ImageDraw, width: int, height: int):
+        """绘制渐变背景（优化版本，使用批量绘制）"""
+        if height <= 0:
+            return
+        
+        step = max(1, height // 100)
+        for y in range(0, height, step):
+            gray_val = 252 - int(8 * y / height)
+            end_y = min(y + step, height)
+            draw.rectangle([(0, y), (width, end_y)], fill=(gray_val, gray_val, gray_val + 2))
     
     def _draw_rounded_rect(self, draw: ImageDraw.ImageDraw, x1: int, y1: int, x2: int, y2: int, radius: int, fill: tuple, outline: tuple):
         """绘制圆角矩形"""
@@ -1035,6 +1041,8 @@ class DatabaseManager:
     
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._user_rank_cache: Dict[int, Tuple[int, float]] = {}
+        self._cache_ttl = 60
         self._init_db()
     
     def _init_db(self):
@@ -1048,11 +1056,12 @@ class DatabaseManager:
                     custom_name TEXT,
                     score INTEGER DEFAULT 0,
                     attempts INTEGER DEFAULT 0,
-                    correct_attempts INTEGER DEFAULT 0,
+                    correct_attempts INTEGER DEFAULT 1,
                     last_play_date TEXT,
                     daily_plays INTEGER DEFAULT 0
                 )
             """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_score ON user_stats(score DESC)")
             cursor.execute("PRAGMA table_info(user_stats)")
             columns = [column[1] for column in cursor.fetchall()]
             if 'custom_name' not in columns:
@@ -1068,6 +1077,10 @@ class DatabaseManager:
         finally:
             conn.close()
     
+    def _invalidate_rank_cache(self):
+        """清除排名缓存"""
+        self._user_rank_cache.clear()
+    
     def get_user_stats(self, user_id: str) -> Optional[Tuple]:
         """获取用户统计"""
         with self._get_connection() as conn:
@@ -1079,11 +1092,54 @@ class DatabaseManager:
             return cursor.fetchone()
     
     def get_user_rank(self, score: int) -> int:
-        """获取用户排名"""
+        """获取用户排名（带缓存）"""
+        current_time = time.time()
+        
+        if score in self._user_rank_cache:
+            cached_rank, cached_time = self._user_rank_cache[score]
+            if current_time - cached_time < self._cache_ttl:
+                return cached_rank
+        
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM user_stats WHERE score > ?", (score,))
-            return cursor.fetchone()[0] + 1
+            rank = cursor.fetchone()[0] + 1
+            
+            self._user_rank_cache[score] = (rank, current_time)
+            return rank
+    
+    def update_user_game_result(self, user_id: str, user_name: str, score: int, correct: bool):
+        """原子性更新用户游戏结果（合并play和score更新）"""
+        today = time.strftime("%Y-%m-%d")
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT score, attempts, correct_attempts, last_play_date, daily_plays FROM user_stats WHERE user_id = ?", (user_id,))
+            user_data = cursor.fetchone()
+            
+            if user_data:
+                old_score, old_attempts, old_correct, last_play_date, daily_plays = user_data
+                new_daily_plays = daily_plays + 1 if last_play_date == today else 1
+                cursor.execute(
+                    """UPDATE user_stats SET 
+                       score = ?, 
+                       attempts = ?, 
+                       correct_attempts = ?, 
+                       user_name = ?, 
+                       last_play_date = ?, 
+                       daily_plays = ? 
+                       WHERE user_id = ?""",
+                    (old_score + score, old_attempts + 1, old_correct + (1 if correct else 0), 
+                     user_name, today, new_daily_plays, user_id)
+                )
+            else:
+                cursor.execute(
+                    """INSERT INTO user_stats 
+                       (user_id, user_name, score, attempts, correct_attempts, last_play_date, daily_plays) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (user_id, user_name, score, 1, 1 if correct else 0, today, 1)
+                )
+            conn.commit()
+            self._invalidate_rank_cache()
     
     def update_user_play(self, user_id: str, user_name: str):
         """更新用户游戏记录"""
@@ -1215,9 +1271,10 @@ class GuessLyricsPlugin(Star):
         self.image_generator = ImageGenerator(font_path if font_path.exists() else None)
         
         self.active_game_sessions: set = set()
-        self.game_sessions: Dict[str, GameSession] = {}
-        self.session_locks: Dict[str, asyncio.Lock] = {}
-        self.last_game_end_time: Dict[str, float] = {}
+        self.game_sessions: Dict[str, GameSession] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
+        self.session_locks: Dict[str, asyncio.Lock] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
+        self.last_game_end_time: Dict[str, float] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
+        self._lock_creation_lock = asyncio.Lock()
         self.song_manager: Optional[LocalSongManager] = None
         self.data_initialized = False
         
@@ -1293,6 +1350,13 @@ class GuessLyricsPlugin(Star):
         last_end_time = self.last_game_end_time.get(session_id, 0)
         return max(0, cooldown - (time.time() - last_end_time))
     
+    async def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """线程安全地获取会话锁"""
+        async with self._lock_creation_lock:
+            if session_id not in self.session_locks:
+                self.session_locks[session_id] = asyncio.Lock()
+            return self.session_locks[session_id]
+    
     def start_new_game(self) -> Optional[GameData]:
         """开始新游戏"""
         if not self.song_manager:
@@ -1363,10 +1427,9 @@ class GuessLyricsPlugin(Star):
         
         session_id = event.unified_msg_origin
         
-        if session_id not in self.session_locks:
-            self.session_locks[session_id] = asyncio.Lock()
+        session_lock = await self._get_session_lock(session_id)
         
-        async with self.session_locks[session_id]:
+        async with session_lock:
             if session_id in self.active_game_sessions:
                 yield event.plain_result("当前已经有一个游戏在进行中啦~ 等它结束后再来玩吧！")
                 return
@@ -1423,8 +1486,6 @@ class GuessLyricsPlugin(Star):
             correct_display_name = self.song_manager.get_display_name(game_data.correct_song)
             logger.info(f"[歌词猜曲插件] 新游戏开始. 答案: {correct_display_name}")
             
-            self.db.update_user_play(user_id, event.get_sender_name())
-            
             game_session = GameSession(game_data=game_data)
             self.game_sessions[session_id] = game_session
             
@@ -1461,13 +1522,13 @@ class GuessLyricsPlugin(Star):
             
             if game_session.answer_index is None:
                 result_text = f"⏰ 时间到！正确答案是 [{correct_index}] {correct_name}"
-                self.db.update_user_score(user_id, event.get_sender_name(), 0, correct=False)
+                self.db.update_user_game_result(user_id, event.get_sender_name(), 0, correct=False)
             elif game_session.answer_index == correct_index:
                 result_text = f"🎉 {event.get_sender_name()}答对了！获得1分！\n正确答案是 [{correct_index}] {correct_name}"
-                self.db.update_user_score(user_id, event.get_sender_name(), 1, correct=True)
+                self.db.update_user_game_result(user_id, event.get_sender_name(), 1, correct=True)
             else:
                 result_text = f"❌ 回答错误！正确答案是 [{correct_index}] {correct_name}"
-                self.db.update_user_score(user_id, event.get_sender_name(), 0, correct=False)
+                self.db.update_user_game_result(user_id, event.get_sender_name(), 0, correct=False)
             
             yield event.plain_result(result_text)
             
@@ -1613,6 +1674,12 @@ class GuessLyricsPlugin(Star):
         custom_name = parts[1].strip() if len(parts) > 1 else None
         
         if custom_name:
+            if len(custom_name) > Config.MAX_CUSTOM_NAME_LENGTH:
+                yield event.plain_result(f"自定义名称过长，最多{Config.MAX_CUSTOM_NAME_LENGTH}个字符哦~")
+                return
+            if not custom_name.replace(' ', '').isprintable():
+                yield event.plain_result("自定义名称包含非法字符！")
+                return
             self.db.set_custom_name(sender_id, event.get_sender_name(), custom_name)
             yield event.plain_result(f"好的！你的自定义名称已设置为：{custom_name} ✨")
         else:
