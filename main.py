@@ -5,6 +5,7 @@ import time
 import os
 import sqlite3
 import urllib.request
+import urllib.error
 import io
 from datetime import datetime
 from contextlib import contextmanager
@@ -206,11 +207,11 @@ class CloudJacketLoader:
             if cache_file.exists():
                 try:
                     return Image.open(cache_file)
-                except Exception as e:
+                except (IOError, OSError) as e:
                     logger.warning(f"Failed to load cached image {cache_file}: {e}")
                     try:
                         cache_file.unlink()
-                    except Exception:
+                    except OSError:
                         pass
         
         url = self.get_jacket_url(music_id)
@@ -227,11 +228,11 @@ class CloudJacketLoader:
                     try:
                         cache_file = self.cache_dir / f"{music_id}.png"
                         img.save(cache_file)
-                    except Exception as save_error:
+                    except (IOError, OSError) as save_error:
                         logger.warning(f"Failed to cache jacket image: {save_error}")
                 
                 return img
-        except Exception as e:
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, IOError) as e:
             logger.warning(f"Failed to load jacket from cloud for music_id {music_id}: {e}")
             return None
 
@@ -267,7 +268,7 @@ class LocalDataManager:
                         data = json.load(f)
                         self._build_cn_map(data)
                     logger.info(f"Loaded {len(self.cn_map)} translations from local file")
-                except Exception as e:
+                except (json.JSONDecodeError, IOError, OSError) as e:
                     logger.warning(f"Failed to load translations: {e}")
             else:
                 logger.warning(f"Translation file not found: {translation_file}")
@@ -292,7 +293,7 @@ class LocalDataManager:
                         self.name_to_id_map[name] = music_id
             
             logger.info(f"Loaded {len(self.cn_map)} translations, {len(self.id_to_name_map)} songs from songs.json")
-        except Exception as e:
+        except (json.JSONDecodeError, IOError, OSError, KeyError) as e:
             logger.warning(f"Failed to load songs data: {e}")
     
     def _build_cn_map(self, search_index_data: List[Dict]):
@@ -318,7 +319,7 @@ class LocalDataManager:
                         data = json.load(f)
                         self._build_aliases_map(data)
                     logger.info(f"Loaded {len(self.aliases_map)} aliases from local file")
-                except Exception as e:
+                except (json.JSONDecodeError, IOError, OSError) as e:
                     logger.warning(f"Failed to load aliases: {e}")
     
     def _parse_aliases_file(self, file_path: Path):
@@ -328,7 +329,7 @@ class LocalDataManager:
                 data = json.load(f)
             self._build_aliases_map(data)
             logger.info(f"Loaded {len(self.aliases_map)} aliases from aliases.json")
-        except Exception as e:
+        except (json.JSONDecodeError, IOError, OSError) as e:
             logger.warning(f"Failed to load aliases data: {e}")
     
     def _build_aliases_map(self, aliases_data: Dict):
@@ -663,7 +664,7 @@ class ImageGenerator:
                 self.card_title_font = ImageFont.truetype(str(self.font_path), Config.Image.FontSize.CARD_TITLE)
                 self.card_subtitle_font = ImageFont.truetype(str(self.font_path), Config.Image.FontSize.CARD_SUBTITLE)
                 return
-            except Exception as e:
+            except (IOError, OSError) as e:
                 logger.error(f"Failed to load fonts: {e}")
         
         self.lyrics_jp_font = default_font
@@ -735,7 +736,7 @@ class ImageGenerator:
                     draw.text((cn_x, y + jp_height + jp_cn_gap), cn_text, font=self.lyrics_cn_font, fill=colors.TEXT_CN)
             
             return img
-        except Exception as e:
+        except (IOError, OSError, ValueError, KeyError) as e:
             logger.error(f"Failed to create lyrics image: {e}")
             return None
     
@@ -781,7 +782,7 @@ class ImageGenerator:
                 self._draw_option_card(img, draw, x, y, num, cn_title, original_name, cover_path)
             
             return img
-        except Exception as e:
+        except (IOError, OSError, ValueError, KeyError) as e:
             logger.error(f"Failed to create options image: {e}")
             return None
     
@@ -851,7 +852,7 @@ class ImageGenerator:
             output.putalpha(mask)
             
             img.paste(output, (cover_x, cover_y), output)
-        except Exception as e:
+        except (IOError, OSError) as e:
             logger.warning(f"Failed to load cover: {e}")
     
     def save_image(self, img: Image.Image, output_dir: Path, prefix: str = "quiz") -> Optional[str]:
@@ -861,7 +862,7 @@ class ImageGenerator:
             filepath = output_dir / f"{prefix}_{time.time_ns()}.png"
             img.save(filepath)
             return str(filepath)
-        except Exception as e:
+        except (IOError, OSError) as e:
             logger.error(f"Failed to save image: {e}")
             return None
     
@@ -990,7 +991,7 @@ class ImageGenerator:
             img.save(img_path)
             return str(img_path)
         
-        except Exception as e:
+        except (IOError, OSError, ValueError, KeyError, TypeError) as e:
             logger.error(f"渲染排行榜图片失败: {e}", exc_info=True)
             return None
     
@@ -1246,7 +1247,7 @@ class GuessLyricsPlugin(Star):
         self.plugin_dir = Path(os.path.dirname(__file__))
         self.resources_dir = self.plugin_dir / "res"
         
-        self.plugin_data_path = Path(get_astrbot_data_path()) / "plugin_data" / self.name
+        self.plugin_data_path = StarTools.get_data_dir(self.name)
         self.lyrics_dir = self.resources_dir / "lyrics"
         self.jacket_cache_dir = self.plugin_data_path / "jacket_cache"
         self.output_dir = self.plugin_data_path / "output"
@@ -1305,7 +1306,7 @@ class GuessLyricsPlugin(Star):
                 f"{len(self.song_manager.songs)} local songs"
             )
             self.data_initialized = True
-        except Exception as e:
+        except (IOError, OSError, ValueError, KeyError) as e:
             logger.error(f"Failed to initialize data: {e}")
     
     def _cleanup_output_dir(self):
@@ -1318,7 +1319,7 @@ class GuessLyricsPlugin(Star):
             for file_path in self.output_dir.iterdir():
                 if file_path.is_file() and (now - file_path.stat().st_mtime) > Config.MAX_AGE_SECONDS:
                     file_path.unlink()
-        except Exception as e:
+        except OSError as e:
             logger.error(f"Cleanup error: {e}")
     
     async def _periodic_cleanup(self):
@@ -1598,7 +1599,7 @@ class GuessLyricsPlugin(Star):
                 f"中文翻译: {len(self.data_manager.cn_map)}\n"
                 f"别名数据: {len(self.data_manager.aliases_map)}"
             )
-        except Exception as e:
+        except (IOError, OSError, ValueError, KeyError) as e:
             logger.error(f"Failed to reload data: {e}")
             yield event.plain_result(f"刷新失败: {e}")
     
@@ -1668,7 +1669,7 @@ class GuessLyricsPlugin(Star):
                 yield event.image_result(str(img_path))
             else:
                 yield event.plain_result("生成排行榜图片时出错。")
-        except Exception as e:
+        except (IOError, OSError, ValueError, KeyError, TypeError) as e:
             logger.error(f"Failed to render ranking: {e}")
             yield event.plain_result("生成排行榜图片时出错。")
     
@@ -1700,3 +1701,17 @@ class GuessLyricsPlugin(Star):
     async def terminate(self):
         """插件终止时的清理"""
         logger.info("Closing PJSK Guess Lyrics Plugin...")
+        
+        if hasattr(self, '_cleanup_task') and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
+        if hasattr(self, '_init_task') and not self._init_task.done():
+            self._init_task.cancel()
+            try:
+                await self._init_task
+            except asyncio.CancelledError:
+                pass
