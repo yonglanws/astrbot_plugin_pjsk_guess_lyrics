@@ -579,9 +579,7 @@ class ImageGenerator:
             logger.error(f"Failed to create lyrics image: {e}")
             return None
     
-    def _get_chinese_translation(self, japanese_line: str) -> str:
-        """获取日文歌词的中文翻译（这里返回空，实际需要翻译数据）"""
-        return ""
+
     
     def create_options_image(self, options: List[Tuple[int, Optional[str], str, Optional[str]]]) -> Optional[Image.Image]:
         """
@@ -1100,7 +1098,7 @@ class GuessLyricsPlugin(Star):
         
         self.active_game_sessions: set = set()
         self.game_sessions: Dict[str, GameSession] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
-        self.session_locks: Dict[str, asyncio.Lock] = {}
+        self.session_locks: Dict[str, asyncio.Lock] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
         self.last_game_end_time: Dict[str, float] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
         self._lock_creation_lock = asyncio.Lock()
         self.song_manager: Optional[LocalSongManager] = None
@@ -1283,7 +1281,9 @@ class GuessLyricsPlugin(Star):
                 yield event.plain_result("开始游戏失败，可能存在歌词文件损坏或格式不正确，请联系管理员检查日志。")
                 return
             
-            lyrics_img = self.image_generator.create_lyrics_image(game_data.lyrics_snippet)
+            lyrics_img = await asyncio.to_thread(
+                self.image_generator.create_lyrics_image, game_data.lyrics_snippet
+            )
             if not lyrics_img:
                 yield event.plain_result("生成歌词图片时出错，请稍后再试。")
                 return
@@ -1307,7 +1307,9 @@ class GuessLyricsPlugin(Star):
                 for i, opt in enumerate(game_data.options)
             ]
             
-            options_img = self.image_generator.create_options_image(options_with_images)
+            options_img = await asyncio.to_thread(
+                self.image_generator.create_options_image, options_with_images
+            )
             if not options_img:
                 yield event.plain_result("生成选项图片时出错，请稍后再试。")
                 return
@@ -1388,7 +1390,6 @@ class GuessLyricsPlugin(Star):
         finally:
             self.active_game_sessions.discard(session_id)
             self.game_sessions.pop(session_id, None)
-            self.session_locks.pop(session_id, None)
     
     @filter.command("歌词猜曲帮助")
     async def show_help(self, event: AstrMessageEvent):
