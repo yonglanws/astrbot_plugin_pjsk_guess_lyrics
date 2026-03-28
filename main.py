@@ -361,175 +361,6 @@ class LocalDataManager:
         """获取歌曲的所有别名"""
         return self.aliases_map.get(music_id, [])
     
-    def check_answer(self, music_id: int, answer: str) -> Tuple[bool, str]:
-        """
-        检查答案是否正确（支持模糊匹配）
-        
-        Args:
-            music_id: 歌曲ID
-            answer: 用户输入的答案
-            
-        Returns:
-            (是否正确, 匹配到的名称)
-        """
-        answer = answer.strip().lower()
-        if not answer:
-            return False, ""
-        
-        cn_title = self.cn_map.get(music_id, "")
-        original_name = self.id_to_name_map.get(music_id, "")
-        aliases = self.aliases_map.get(music_id, [])
-        
-        all_names = [cn_title, original_name] + aliases
-        all_names = [n for n in all_names if n]
-        
-        for name in all_names:
-            if answer == name.lower():
-                return True, name
-        
-        for name in all_names:
-            name_lower = name.lower()
-            if answer == name_lower:
-                return True, name
-            if (answer in name_lower or name_lower in answer) and len(answer) >= 4:
-                return True, name
-        
-        if len(answer) >= 4:
-            for name in all_names:
-                if self._similar(answer, name.lower(), threshold=0.8):
-                    return True, name
-        
-        if len(answer) >= 4:
-            for name in all_names:
-                if self._fuzzy_match(answer, name.lower()):
-                    return True, name
-        
-        if len(answer) >= 3:
-            for name in all_names:
-                if self._typo_tolerant_match(answer, name.lower()):
-                    return True, name
-        
-        return False, ""
-    
-    def _fuzzy_match(self, s1: str, s2: str) -> bool:
-        """
-        模糊匹配，允许部分字符不匹配
-        """
-        if not s1 or not s2:
-            return False
-        
-        s1, s2 = s1.lower(), s2.lower()
-        
-        if s1 == s2:
-            return True
-        
-        if len(s1) < 2 or len(s2) < 2:
-            return False
-        
-        s1_chars = set(s1)
-        s2_chars = set(s2)
-        common_chars = s1_chars & s2_chars
-        
-        if len(common_chars) == 0:
-            return False
-        
-        similarity = len(common_chars) / min(len(s1_chars), len(s2_chars))
-        if similarity >= 0.6:
-            s1_no_space = s1.replace(" ", "")
-            s2_no_space = s2.replace(" ", "")
-            
-            if self._contains_significant_substring(s1_no_space, s2_no_space):
-                return True
-        
-        return False
-    
-    def _contains_significant_substring(self, s1: str, s2: str) -> bool:
-        """
-        检查是否包含有意义的子串
-        """
-        min_len = min(len(s1), len(s2))
-        check_len = max(2, int(min_len * 0.4))
-        
-        for i in range(len(s1) - check_len + 1):
-            substr = s1[i:i + check_len]
-            if substr in s2:
-                return True
-        
-        for i in range(len(s2) - check_len + 1):
-            substr = s2[i:i + check_len]
-            if substr in s1:
-                return True
-        
-        return False
-    
-    def _typo_tolerant_match(self, s1: str, s2: str) -> bool:
-        """
-        容错匹配，处理常见拼写错误
-        """
-        if not s1 or not s2:
-            return False
-        
-        s1, s2 = s1.lower(), s2.lower()
-        
-        typo_groups = [
-            {'l', '1', 'i'},
-            {'o', '0'},
-            {'s', '5'},
-            {'z', '2'},
-            {'b', '8'},
-            {'e', '3'},
-            {'a', '4'},
-            {'t', '7'},
-            {'n', 'm'},
-            {'u', 'v'},
-            {'c', 'k'},
-        ]
-        
-        typo_map = {}
-        for group in typo_groups:
-            for char in group:
-                typo_map[char] = group
-        
-        def normalize(s: str) -> str:
-            result = []
-            for c in s:
-                if c in typo_map:
-                    result.append(sorted(typo_map[c])[0])
-                else:
-                    result.append(c)
-            return ''.join(result)
-        
-        s1_normalized = normalize(s1)
-        s2_normalized = normalize(s2)
-        
-        if s1_normalized == s2_normalized:
-            return True
-        
-        if s1 in s2_normalized or s2_normalized in s1:
-            return True
-        if s2 in s1_normalized or s1_normalized in s2:
-            return True
-        
-        return False
-    
-    def _similar(self, s1: str, s2: str, threshold: float = 0.7) -> bool:
-        """简单的字符串相似度判断"""
-        if not s1 or not s2:
-            return False
-        
-        s1, s2 = s1.lower(), s2.lower()
-        
-        if s1 == s2:
-            return True
-        
-        if s1 in s2 or s2 in s1:
-            return True
-        
-        common = sum(1 for c in s1 if c in s2)
-        similarity = common / max(len(s1), len(s2))
-        
-        return similarity >= threshold
-    
     def reload_data(self):
         """重新加载本地数据"""
         self.cn_map.clear()
@@ -1118,35 +949,23 @@ class DatabaseManager:
             return rank
     
     def update_user_game_result(self, user_id: str, user_name: str, score: int, correct: bool):
-        """原子性更新用户游戏结果（合并play和score更新）"""
+        """原子性更新用户游戏结果（使用纯SQL原子操作）"""
         today = time.strftime("%Y-%m-%d")
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT score, attempts, correct_attempts, last_play_date, daily_plays FROM user_stats WHERE user_id = ?", (user_id,))
-            user_data = cursor.fetchone()
-            
-            if user_data:
-                old_score, old_attempts, old_correct, last_play_date, daily_plays = user_data
-                new_daily_plays = daily_plays + 1 if last_play_date == today else 1
-                cursor.execute(
-                    """UPDATE user_stats SET 
-                       score = ?, 
-                       attempts = ?, 
-                       correct_attempts = ?, 
-                       user_name = ?, 
-                       last_play_date = ?, 
-                       daily_plays = ? 
-                       WHERE user_id = ?""",
-                    (old_score + score, old_attempts + 1, old_correct + (1 if correct else 0), 
-                     user_name, today, new_daily_plays, user_id)
-                )
-            else:
-                cursor.execute(
-                    """INSERT INTO user_stats 
-                       (user_id, user_name, score, attempts, correct_attempts, last_play_date, daily_plays) 
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (user_id, user_name, score, 1, 1 if correct else 0, today, 1)
-                )
+            cursor.execute(
+                """INSERT INTO user_stats (user_id, user_name, score, attempts, correct_attempts, last_play_date, daily_plays)
+                   VALUES (?, ?, ?, 1, ?, ?, 1)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                       score = score + excluded.score,
+                       attempts = attempts + 1,
+                       correct_attempts = correct_attempts + excluded.correct_attempts,
+                       user_name = excluded.user_name,
+                       last_play_date = excluded.last_play_date,
+                       daily_plays = CASE WHEN last_play_date = excluded.last_play_date THEN daily_plays + 1 ELSE 1 END
+                """,
+                (user_id, user_name, score, 1 if correct else 0, today)
+            )
             conn.commit()
             self._invalidate_rank_cache()
     
@@ -1281,7 +1100,7 @@ class GuessLyricsPlugin(Star):
         
         self.active_game_sessions: set = set()
         self.game_sessions: Dict[str, GameSession] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
-        self.session_locks: Dict[str, asyncio.Lock] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
+        self.session_locks: Dict[str, asyncio.Lock] = {}
         self.last_game_end_time: Dict[str, float] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
         self._lock_creation_lock = asyncio.Lock()
         self.song_manager: Optional[LocalSongManager] = None
@@ -1569,6 +1388,7 @@ class GuessLyricsPlugin(Star):
         finally:
             self.active_game_sessions.discard(session_id)
             self.game_sessions.pop(session_id, None)
+            self.session_locks.pop(session_id, None)
     
     @filter.command("歌词猜曲帮助")
     async def show_help(self, event: AstrMessageEvent):
