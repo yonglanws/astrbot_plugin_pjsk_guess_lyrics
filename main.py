@@ -34,7 +34,7 @@ except ImportError:
     class StarTools:
         @staticmethod
         def get_data_dir(plugin_name: str) -> Path:
-            return Path(__file__).parent.parent.parent.parent / 'data' / 'plugins_data' / plugin_name
+            return Path(__file__).parent.parent.parent.parent / 'data' / 'plugin_data' / plugin_name
 
     def get_astrbot_data_path() -> Path:
         return Path(__file__).parent.parent.parent.parent / 'data'
@@ -206,7 +206,8 @@ class CloudJacketLoader:
             cache_file = self.cache_dir / f"{music_id}.png"
             if cache_file.exists():
                 try:
-                    return Image.open(cache_file)
+                    with Image.open(cache_file) as img:
+                        return img.copy()
                 except (IOError, OSError) as e:
                     logger.warning(f"Failed to load cached image {cache_file}: {e}")
                     try:
@@ -223,6 +224,7 @@ class CloudJacketLoader:
             with urllib.request.urlopen(req, timeout=10) as response:
                 img_data = response.read()
                 img = Image.open(io.BytesIO(img_data))
+                img.load()
                 
                 if self.cache_dir:
                     try:
@@ -389,23 +391,23 @@ class LocalDataManager:
             name_lower = name.lower()
             if answer == name_lower:
                 return True, name
-            if answer in name_lower or name_lower in answer:
-                if len(answer) >= 2:
-                    return True, name
+            if (answer in name_lower or name_lower in answer) and len(answer) >= 4:
+                return True, name
         
-        if len(answer) >= 2:
+        if len(answer) >= 4:
             for name in all_names:
-                if self._similar(answer, name.lower()):
+                if self._similar(answer, name.lower(), threshold=0.8):
                     return True, name
         
-        if len(answer) >= 2:
+        if len(answer) >= 4:
             for name in all_names:
                 if self._fuzzy_match(answer, name.lower()):
                     return True, name
         
-        for name in all_names:
-            if self._typo_tolerant_match(answer, name.lower()):
-                return True, name
+        if len(answer) >= 3:
+            for name in all_names:
+                if self._typo_tolerant_match(answer, name.lower()):
+                    return True, name
         
         return False, ""
     
@@ -469,26 +471,32 @@ class LocalDataManager:
         
         s1, s2 = s1.lower(), s2.lower()
         
-        common_typos = {
-            'l': '1', '1': 'l', 'i': '1', '1': 'i', 'i': 'l', 'l': 'i',
-            'o': '0', '0': 'o',
-            's': '5', '5': 's',
-            'z': '2', '2': 'z',
-            'b': '8', '8': 'b',
-            'e': '3', '3': 'e',
-            'a': '4', '4': 'a',
-            't': '7', '7': 't',
-            'n': 'm', 'm': 'n',
-            'u': 'v', 'v': 'u',
-            'c': 'k', 'k': 'c',
-        }
+        typo_groups = [
+            {'l', '1', 'i'},
+            {'o', '0'},
+            {'s', '5'},
+            {'z', '2'},
+            {'b', '8'},
+            {'e', '3'},
+            {'a', '4'},
+            {'t', '7'},
+            {'n', 'm'},
+            {'u', 'v'},
+            {'c', 'k'},
+        ]
+        
+        typo_map = {}
+        for group in typo_groups:
+            for char in group:
+                typo_map[char] = group
         
         def normalize(s: str) -> str:
             result = []
             for c in s:
-                if c in common_typos:
-                    result.append(common_typos[c])
-                result.append(c)
+                if c in typo_map:
+                    result.append(sorted(typo_map[c])[0])
+                else:
+                    result.append(c)
             return ''.join(result)
         
         s1_normalized = normalize(s1)
@@ -1057,7 +1065,7 @@ class DatabaseManager:
                     custom_name TEXT,
                     score INTEGER DEFAULT 0,
                     attempts INTEGER DEFAULT 0,
-                    correct_attempts INTEGER DEFAULT 1,
+                    correct_attempts INTEGER DEFAULT 0,
                     last_play_date TEXT,
                     daily_plays INTEGER DEFAULT 0
                 )
@@ -1343,7 +1351,9 @@ class GuessLyricsPlugin(Star):
     def _is_super_user(self, user_id: str) -> bool:
         """检查是否为超级用户"""
         super_users = {str(x) for x in self.config.get("super_users", [])}
-        return not super_users or str(user_id) in super_users
+        if not super_users:
+            return False
+        return str(user_id) in super_users
     
     def _get_cooldown_remaining(self, session_id: str) -> float:
         """获取冷却剩余时间"""
@@ -1459,18 +1469,24 @@ class GuessLyricsPlugin(Star):
                 yield event.plain_result("生成歌词图片时出错，请稍后再试。")
                 return
             
-            # 加载曲绘图片并创建选项图片
-            options_with_images = []
-            for i, opt in enumerate(game_data.options):
+            async def load_single_jacket(opt):
+                """加载单个曲绘"""
                 jacket_img = await asyncio.to_thread(
                     self.song_manager.get_jacket_image, opt
                 )
-                jacket_path = None
                 if jacket_img:
                     temp_path = self.output_dir / f"temp_jacket_{opt.music_id}_{time.time_ns()}.png"
                     jacket_img.save(temp_path)
-                    jacket_path = str(temp_path)
-                options_with_images.append((i + 1, opt.cn_title, opt.original_name, jacket_path))
+                    return str(temp_path)
+                return None
+            
+            jacket_tasks = [load_single_jacket(opt) for opt in game_data.options]
+            jacket_paths = await asyncio.gather(*jacket_tasks)
+            
+            options_with_images = [
+                (i + 1, opt.cn_title, opt.original_name, jacket_paths[i])
+                for i, opt in enumerate(game_data.options)
+            ]
             
             options_img = self.image_generator.create_options_image(options_with_images)
             if not options_img:
@@ -1532,13 +1548,12 @@ class GuessLyricsPlugin(Star):
             
             if game_session.answer_index is None:
                 result_text = f"⏰ 时间到！正确答案是 [{correct_index}] {correct_name}"
-                self.db.update_user_game_result(user_id, event.get_sender_name(), 0, correct=False)
             elif game_session.answer_index == correct_index:
                 result_text = f"🎉 {result_user_name}答对了！获得1分！\n正确答案是 [{correct_index}] {correct_name}"
                 self.db.update_user_game_result(result_user_id, result_user_name, 1, correct=True)
             else:
-                result_text = f"❌ 回答错误！正确答案是 [{correct_index}] {correct_name}"
-                self.db.update_user_game_result(user_id, event.get_sender_name(), 0, correct=False)
+                result_text = f"❌ {result_user_name}回答错误！正确答案是 [{correct_index}] {correct_name}"
+                self.db.update_user_game_result(result_user_id, result_user_name, 0, correct=False)
             
             yield event.plain_result(result_text)
             
