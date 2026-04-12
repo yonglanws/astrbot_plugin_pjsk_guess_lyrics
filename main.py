@@ -50,7 +50,7 @@ except ImportError:
 PLUGIN_NAME = "pjsk_guess_lyrics"
 PLUGIN_AUTHOR = "慵懒午睡"
 PLUGIN_DESCRIPTION = "PJSK歌词猜曲插件"
-PLUGIN_VERSION = "2.5.0"
+PLUGIN_VERSION = "1.0.1"
 PLUGIN_REPO_URL = "https://github.com/yonglanws/astrbot_plugin_pjsk_guess_lyrics"
 
 
@@ -85,6 +85,12 @@ class GameSession:
     game_data: Optional[GameData] = None
     answer_index: Optional[int] = None
     game_ended_by_timeout: bool = False
+    total_attempts: int = 0
+    player_attempts: Dict[str, int] = None
+    
+    def __post_init__(self):
+        if self.player_attempts is None:
+            self.player_attempts = {}
 
 
 class LRUDict(OrderedDict):
@@ -568,12 +574,7 @@ class ImageGenerator:
                 
                 draw.text((x, y), line, font=self.lyrics_jp_font, fill=colors.TEXT_JP)
                 
-                cn_text = self._get_chinese_translation(line)
-                if cn_text:
-                    cn_width = self._get_text_width(draw, cn_text, self.lyrics_cn_font)
-                    cn_x = (img_width - cn_width) // 2
-                    draw.text((cn_x, y + jp_height + jp_cn_gap), cn_text, font=self.lyrics_cn_font, fill=colors.TEXT_CN)
-            
+               
             return img
         except (IOError, OSError, ValueError, KeyError) as e:
             logger.error(f"Failed to create lyrics image: {e}")
@@ -1160,6 +1161,13 @@ class GuessLyricsPlugin(Star):
             return True
         group_id = event.get_group_id()
         return bool(group_id and str(group_id) in whitelist)
+
+    def _get_whitelist_reject_message(self) -> Optional[str]:
+        """获取白名单拒绝提示信息"""
+        msg = self.config.get("whitelist_reject_message", "")
+        if msg and msg.strip():
+            return msg.strip()
+        return None
     
     def _is_user_blacklisted(self, user_id: str) -> bool:
         """检查用户是否在黑名单中"""
@@ -1244,8 +1252,11 @@ class GuessLyricsPlugin(Star):
         if not self.data_initialized:
             yield event.plain_result("数据正在初始化中，请稍后再试...")
             return
-        
+
         if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
             return
         
         user_id = event.get_sender_id()
@@ -1281,12 +1292,13 @@ class GuessLyricsPlugin(Star):
                 yield event.plain_result("开始游戏失败，可能存在歌词文件损坏或格式不正确，请联系管理员检查日志。")
                 return
             
-            lyrics_img = await asyncio.to_thread(
-                self.image_generator.create_lyrics_image, game_data.lyrics_snippet
-            )
-            if not lyrics_img:
-                yield event.plain_result("生成歌词图片时出错，请稍后再试。")
-                return
+            max_attempts_per_player = max(1, int(self.config.get("max_attempts_per_player", 1)))
+            max_attempts_total = max(1, int(self.config.get("max_attempts_total", 5)))
+            lyrics_display_mode = str(self.config.get("lyrics_display_mode", "image")).lower()
+            
+            if lyrics_display_mode not in ["image", "text"]:
+                logger.warning(f"Invalid lyrics_display_mode '{lyrics_display_mode}', defaulting to 'image'")
+                lyrics_display_mode = "image"
             
             async def load_single_jacket(opt):
                 """加载单个曲绘"""
@@ -1314,45 +1326,146 @@ class GuessLyricsPlugin(Star):
                 yield event.plain_result("生成选项图片时出错，请稍后再试。")
                 return
             
-            lyrics_img_path = self.image_generator.save_image(lyrics_img, self.output_dir, "lyrics")
             options_img_path = self.image_generator.save_image(options_img, self.output_dir, "options")
             
-            if not lyrics_img_path or not options_img_path:
+            if not options_img_path:
                 yield event.plain_result("保存图片时出错，请稍后再试。")
                 return
             
             correct_display_name = self.song_manager.get_display_name(game_data.correct_song)
-            logger.info(f"[歌词猜曲插件] 新游戏开始. 答案: {correct_display_name}")
+            logger.info(f"[歌词猜曲插件] 新游戏开始. 答案: {correct_display_name}, 模式: {lyrics_display_mode}")
             
             game_session = GameSession(game_data=game_data)
             self.game_sessions[session_id] = game_session
             
             timeout_seconds = self.config.get("answer_timeout", Config.DEFAULT_TIMEOUT)
-            intro_text = f"🎵 歌词猜曲 🎵\n请在{timeout_seconds}秒内输入数字(1-10)选择正确答案~\n\n歌词片段：\n"
             
-            yield event.chain_result([
-                Comp.Plain(intro_text),
-                Comp.Image(file=lyrics_img_path),
-                Comp.Image(file=options_img_path)
-            ])
+            await asyncio.to_thread(self.db.update_user_play, user_id, event.get_sender_name())
             
-            answered_user_id = None
-            answered_user_name = None
+            if lyrics_display_mode == "text":
+                lyrics_text = "\n".join(game_data.lyrics_snippet)
+                intro_text = (
+                    f"请在{timeout_seconds}秒内输入数字(1-10)选择正确答案~\n"
+                    f"每位玩家最多可回答{max_attempts_per_player}次，全局共{max_attempts_total}次机会\n\n"
+                    f"【歌词片段】\n{lyrics_text}\n\n"
+                )
+                
+                yield event.chain_result([
+                    Comp.Plain(intro_text),
+                    Comp.Image(file=options_img_path)
+                ])
+            else:
+                lyrics_img = await asyncio.to_thread(
+                    self.image_generator.create_lyrics_image, game_data.lyrics_snippet
+                )
+                if not lyrics_img:
+                    yield event.plain_result("生成歌词图片时出错，请稍后再试。")
+                    return
+                
+                lyrics_img_path = self.image_generator.save_image(lyrics_img, self.output_dir, "lyrics")
+                if not lyrics_img_path:
+                    yield event.plain_result("保存图片时出错，请稍后再试。")
+                    return
+                
+                intro_text = (
+                    f"请在{timeout_seconds}秒内输入数字(1-10)选择正确答案~\n"
+                    f"每位玩家最多可回答{max_attempts_per_player}次，全局共{max_attempts_total}次机会\n\n"
+                    f"歌词片段：\n"
+                )
+                
+                yield event.chain_result([
+                    Comp.Plain(intro_text),
+                    Comp.Image(file=lyrics_img_path),
+                    Comp.Image(file=options_img_path)
+                ])
+            
+            answered_correctly = False
+            final_answer_user_id = None
+            final_answer_user_name = None
+            final_answer_index = None
+            all_answers_history = []
+            winners_list = []  # 记录所有获奖者（用于奖励有效时间功能）
+            first_correct_time = None  # 记录第一个答对的时间
+            reward_valid_time = self.config.get("reward_valid_time", 0)  # 奖励有效时间配置
+            
+            logger.info(f"[歌词猜曲] 奖励有效时间配置: {reward_valid_time}秒")
             
             @session_waiter(timeout=timeout_seconds)
             async def answer_waiter(controller: SessionController, answer_event: AstrMessageEvent):
-                nonlocal answered_user_id, answered_user_name
+                nonlocal answered_correctly, final_answer_user_id, final_answer_user_name, final_answer_index
+                nonlocal all_answers_history, first_correct_time, winners_list
+                
+                answer_user_id = answer_event.get_sender_id()
                 answer_text = answer_event.message_str.strip()
-                if answer_text.isdigit():
-                    try:
-                        selected_num = int(answer_text)
-                        if 1 <= selected_num <= 10:
-                            game_session.answer_index = selected_num
-                            answered_user_id = answer_event.get_sender_id()
-                            answered_user_name = answer_event.get_sender_name()
+                
+                if not answer_text.isdigit():
+                    return
+                
+                try:
+                    selected_num = int(answer_text)
+                    if not (1 <= selected_num <= 10):
+                        return
+                except ValueError:
+                    return
+                
+                player_current_attempts = game_session.player_attempts.get(answer_user_id, 0)
+                if player_current_attempts >= max_attempts_per_player:
+                    return
+                
+                if game_session.total_attempts >= max_attempts_total:
+                    controller.stop()
+                    return
+                
+                game_session.total_attempts += 1
+                game_session.player_attempts[answer_user_id] = player_current_attempts + 1
+                
+                all_answers_history.append({
+                    'user_id': answer_user_id,
+                    'user_name': answer_event.get_sender_name(),
+                    'selected_num': selected_num,
+                    'attempt_number': game_session.total_attempts
+                })
+                
+                correct_index = game_session.game_data.correct_index + 1
+                
+                if selected_num == correct_index:
+                    current_time = time.time()
+                    
+                    if not answered_correctly:
+                        answered_correctly = True
+                        final_answer_user_id = answer_user_id
+                        final_answer_user_name = answer_event.get_sender_name()
+                        final_answer_index = selected_num
+                        first_correct_time = current_time
+                        winners_list.append({
+                            'user_id': answer_user_id,
+                            'user_name': answer_event.get_sender_name(),
+                            'answer_time': current_time,
+                            'is_first': True
+                        })
+                        
+                        if reward_valid_time > 0:
+                            logger.info(f"[歌词猜曲] 第一个答对者: {final_answer_user_name}，启动{reward_valid_time}秒奖励有效时间")
+                            async def stop_after_delay():
+                                await asyncio.sleep(reward_valid_time)
+                                controller.stop()
+                            asyncio.create_task(stop_after_delay())
+                        else:
                             controller.stop()
-                    except ValueError:
-                        pass
+                    else:
+                        time_since_first_correct = current_time - first_correct_time
+                        if time_since_first_correct <= reward_valid_time and reward_valid_time > 0:
+                            if not any(w['user_id'] == answer_user_id for w in winners_list):
+                                winners_list.append({
+                                    'user_id': answer_user_id,
+                                    'user_name': answer_event.get_sender_name(),
+                                    'answer_time': current_time,
+                                    'is_first': False
+                                })
+                                logger.info(f"[歌词猜曲] 奖励有效时间内额外答对: {answer_event.get_sender_name()} (+{time_since_first_correct:.2f}s)")
+                else:
+                    if game_session.total_attempts >= max_attempts_total:
+                        controller.stop()
             
             try:
                 await answer_waiter(event)
@@ -1364,21 +1477,64 @@ class GuessLyricsPlugin(Star):
             correct_name = self.song_manager.get_display_name(game_session.game_data.correct_song)
             correct_index = game_session.game_data.correct_index + 1
             
-            result_user_id = answered_user_id if answered_user_id else user_id
-            result_user_name = answered_user_name if answered_user_name else event.get_sender_name()
-            
-            if game_session.answer_index is None:
+            if game_session.game_ended_by_timeout and not answered_correctly:
                 result_text = f"⏰ 时间到！正确答案是 [{correct_index}] {correct_name}"
-            elif game_session.answer_index == correct_index:
-                result_text = f"🎉 {result_user_name}答对了！获得1分！\n正确答案是 [{correct_index}] {correct_name}"
-                self.db.update_user_game_result(result_user_id, result_user_name, 1, correct=True)
+            elif answered_correctly:
+                if len(winners_list) == 1:
+                    result_text = (
+                        f"🎉 {final_answer_user_name} 答对了！获得1分！\n"
+                        f"正确答案是 [{correct_index}] {correct_name}\n"
+                    )
+                    self.db.update_user_game_result(final_answer_user_id, final_answer_user_name, 1, correct=True)
+                    
+                    for answer_record in all_answers_history:
+                        if answer_record['user_id'] != final_answer_user_id or answer_record['selected_num'] != correct_index:
+                            self.db.update_user_game_result(
+                                answer_record['user_id'], 
+                                answer_record['user_name'], 
+                                0, 
+                                correct=False
+                            )
+                else:
+                    winner_names = [w['user_name'] for w in winners_list]
+                    result_text = (
+                        f"🎉 恭喜以下玩家答对！每人获得1分！\n"
+                        f"{'、'.join(winner_names)}\n\n"
+                        f"正确答案是 [{correct_index}] {correct_name}"
+                    )
+                    
+                    for winner in winners_list:
+                        self.db.update_user_game_result(
+                            winner['user_id'],
+                            winner['user_name'],
+                            1,
+                            correct=True
+                        )
+                    
+                    for answer_record in all_answers_history:
+                        if not any(w['user_id'] == answer_record['user_id'] for w in winners_list):
+                            self.db.update_user_game_result(
+                                answer_record['user_id'],
+                                answer_record['user_name'],
+                                0,
+                                correct=False
+                            )
             else:
-                result_text = f"❌ {result_user_name}回答错误！正确答案是 [{correct_index}] {correct_name}"
-                self.db.update_user_game_result(result_user_id, result_user_name, 0, correct=False)
+                result_text = (
+                    f"⚠️ 作答次数已全部用尽！\n"
+                    f"正确答案是 [{correct_index}] {correct_name}\n"
+                )
+                
+                for answer_record in all_answers_history:
+                    self.db.update_user_game_result(
+                        answer_record['user_id'],
+                        answer_record['user_name'],
+                        0,
+                        correct=False
+                    )
             
             yield event.plain_result(result_text)
             
-            # 显示正确答案的曲绘
             correct_jacket_img = await asyncio.to_thread(
                 self.song_manager.get_jacket_image, game_session.game_data.correct_song
             )
@@ -1386,7 +1542,7 @@ class GuessLyricsPlugin(Star):
                 jacket_path = self.output_dir / f"correct_jacket_{time.time_ns()}.png"
                 correct_jacket_img.save(jacket_path)
                 yield event.image_result(str(jacket_path))
-            
+        
         finally:
             self.active_game_sessions.discard(session_id)
             self.game_sessions.pop(session_id, None)
@@ -1395,17 +1551,35 @@ class GuessLyricsPlugin(Star):
     async def show_help(self, event: AstrMessageEvent):
         """显示帮助信息"""
         if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
             return
+        
+        max_attempts_per_player = self.config.get("max_attempts_per_player", 1)
+        max_attempts_total = self.config.get("max_attempts_total", 5)
+        lyrics_display_mode = str(self.config.get("lyrics_display_mode", "image")).lower()
         
         help_text = (
             "🎵 PJSK 歌词猜曲指南 🎵\n\n"
-            "【歌词猜曲】\n"
+            "【游戏指令】\n"
             "歌词猜曲 - 随机一首歌曲，展示歌词片段，猜出歌名！\n"
             "歌词猜曲分数 - 查看自己的游戏数据统计\n"
             "歌词猜曲排行榜 - 查看总分排行榜\n"
-            "歌词猜曲自定义名称 - 设置你的个性化ID\n\n"
+            "歌词猜曲自定义名称 [名称] - 设置你的个性化ID（不带参数可清除）\n\n"
+            "【当前配置】\n"
+            f"• 每位玩家每轮可作答: {max_attempts_per_player} 次\n"
+            f"• 全局总作答次数: {max_attempts_total} 次\n"
+            f"• 歌词展示模式: {'图片模式' if lyrics_display_mode == 'image' else '纯文本模式'}\n\n"
             "【管理员指令】\n"
-            "刷新本地数据 - 重新加载本地翻译和别名数据\n"
+            "刷新本地数据 - 重新加载本地翻译和别名数据\n\n"
+            "【玩法说明】\n"
+            "1. 发送「歌词猜曲」开始游戏\n"
+            "2. 系统随机选择一首歌曲并展示歌词片段\n"
+            "3. 在限时内输入数字(1-10)选择正确答案\n"
+            "4. 每位玩家有独立的作答次数限制，全局也有总次数限制\n"
+            "5. 任一限制触发或有人答对时，本轮结束\n"
+            "6. 答对获得1分，答错不计分但会消耗作答机会"
         )
         yield event.plain_result(help_text)
     
@@ -1413,6 +1587,9 @@ class GuessLyricsPlugin(Star):
     async def reload_local_data(self, event: AstrMessageEvent):
         """刷新本地数据"""
         if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
             return
         
         if not self._is_super_user(event.get_sender_id()):
@@ -1443,6 +1620,9 @@ class GuessLyricsPlugin(Star):
     async def show_user_score(self, event: AstrMessageEvent):
         """显示用户分数"""
         if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
             return
         
         user_id = event.get_sender_id()
@@ -1484,6 +1664,9 @@ class GuessLyricsPlugin(Star):
     async def show_ranking(self, event: AstrMessageEvent):
         """显示排行榜"""
         if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
             return
         
         self._cleanup_output_dir()
@@ -1513,6 +1696,9 @@ class GuessLyricsPlugin(Star):
     async def set_custom_name(self, event: AstrMessageEvent):
         """设置自定义名称"""
         if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
             return
         
         sender_id = event.get_sender_id()
