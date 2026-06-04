@@ -1,4 +1,5 @@
 name: astrbot_plugin_pjsk_guess_lyrics
+display_name: PJSK歌词猜曲插件
 desc: 专注于《初音未来 缤纷舞台》的歌词猜曲游戏插件。用户根据歌词片段猜出歌曲名称
 version: v1.0.1
 author: 慵懒午睡

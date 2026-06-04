@@ -1105,6 +1105,9 @@ class GuessLyricsPlugin(Star):
         self.song_manager: Optional[LocalSongManager] = None
         self.data_initialized = False
         
+        self.auto_sessions: set = set()
+        self.auto_stop_events: Dict[str, asyncio.Event] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
+        
         self._cleanup_output_dir()
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
         self._init_task = asyncio.create_task(self._initialize_data())
@@ -1246,9 +1249,364 @@ class GuessLyricsPlugin(Star):
         
         return lyrics[start_index:start_index + count]
     
+    async def _run_game_impl(self, event: AstrMessageEvent, auto_mode: bool = False):
+        """歌词猜曲游戏核心逻辑"""
+        if not self.data_initialized:
+            yield event.plain_result("数据正在初始化中，请稍后再试...")
+            return
+
+        if not self._is_group_allowed(event):
+            reject_msg = self._get_whitelist_reject_message()
+            if reject_msg:
+                yield event.plain_result(reject_msg)
+            return
+        
+        user_id = event.get_sender_id()
+        if self._is_user_blacklisted(user_id):
+            yield event.plain_result("抱歉，你已被禁止使用此功能 😔")
+            return
+        
+        session_id = event.unified_msg_origin
+        first_round = True
+        
+        while True:
+            session_lock = await self._get_session_lock(session_id)
+            
+            async with session_lock:
+                if session_id in self.active_game_sessions:
+                    if first_round:
+                        yield event.plain_result("当前已经有一个游戏在进行中啦~ 等它结束后再来玩吧！")
+                        return
+                    else:
+                        yield event.plain_result("检测到有人开始了新游戏，自动模式已停止。")
+                        break
+                
+                if not first_round and not auto_mode:
+                    break
+                
+                # 冷却检查：自动模式下跳过（每轮之间由自动模式自己控制间隔）
+                if not auto_mode or first_round:
+                    cooldown_remaining = self._get_cooldown_remaining(session_id)
+                    if cooldown_remaining > 0:
+                        time_display = f"{cooldown_remaining:.1f}" if cooldown_remaining < 1 else str(int(cooldown_remaining))
+                        yield event.plain_result(f"让我们休息一下吧！{time_display}秒后再来玩哦~ 😊")
+                        return
+                
+                daily_limit = self.config.get("daily_play_limit", Config.DEFAULT_DAILY_LIMIT)
+                if not self.db.can_play_today(user_id, daily_limit):
+                    if auto_mode:
+                        yield event.plain_result(f"今天的游戏次数已经用完啦~ 自动模式已停止！每天最多可以玩{daily_limit}次哦~ ✨")
+                        break
+                    else:
+                        yield event.plain_result(f"今天的游戏次数已经用完啦~ 明天再来玩吧！每天最多可以玩{daily_limit}次哦~ ✨")
+                        return
+                
+                self.active_game_sessions.add(session_id)
+            
+            try:
+                game_data = self.start_new_game()
+                if not game_data:
+                    yield event.plain_result("开始游戏失败，可能存在歌词文件损坏或格式不正确，请联系管理员检查日志。")
+                    break
+                
+                max_attempts_per_player = max(1, int(self.config.get("max_attempts_per_player", 1)))
+                max_attempts_total = max(1, int(self.config.get("max_attempts_total", 5)))
+                lyrics_display_mode = str(self.config.get("lyrics_display_mode", "image")).lower()
+                
+                if lyrics_display_mode not in ["image", "text"]:
+                    logger.warning(f"Invalid lyrics_display_mode '{lyrics_display_mode}', defaulting to 'image'")
+                    lyrics_display_mode = "image"
+                
+                async def load_single_jacket(opt):
+                    """加载单个曲绘"""
+                    jacket_img = await asyncio.to_thread(
+                        self.song_manager.get_jacket_image, opt
+                    )
+                    if jacket_img:
+                        temp_path = self.output_dir / f"temp_jacket_{opt.music_id}_{time.time_ns()}.png"
+                        jacket_img.save(temp_path)
+                        return str(temp_path)
+                    return None
+                
+                jacket_tasks = [load_single_jacket(opt) for opt in game_data.options]
+                jacket_paths = await asyncio.gather(*jacket_tasks)
+                
+                options_with_images = [
+                    (i + 1, opt.cn_title, opt.original_name, jacket_paths[i])
+                    for i, opt in enumerate(game_data.options)
+                ]
+                
+                options_img = await asyncio.to_thread(
+                    self.image_generator.create_options_image, options_with_images
+                )
+                if not options_img:
+                    yield event.plain_result("生成选项图片时出错，请稍后再试。")
+                    break
+                
+                options_img_path = self.image_generator.save_image(options_img, self.output_dir, "options")
+                
+                if not options_img_path:
+                    yield event.plain_result("保存图片时出错，请稍后再试。")
+                    break
+                
+                correct_display_name = self.song_manager.get_display_name(game_data.correct_song)
+                logger.info(f"[歌词猜曲插件] 新游戏开始. 答案: {correct_display_name}, 模式: {lyrics_display_mode}, 自动模式: {auto_mode}")
+                
+                game_session = GameSession(game_data=game_data)
+                self.game_sessions[session_id] = game_session
+                
+                timeout_seconds = self.config.get("answer_timeout", Config.DEFAULT_TIMEOUT)
+                
+                await asyncio.to_thread(self.db.update_user_play, user_id, event.get_sender_name())
+                
+                if lyrics_display_mode == "text":
+                    lyrics_text = "\n".join(game_data.lyrics_snippet)
+                    intro_text = (
+                        f"请在{timeout_seconds}秒内输入数字(1-10)选择正确答案~\n"
+                        f"每位玩家最多可回答{max_attempts_per_player}次，全局共{max_attempts_total}次机会\n\n"
+                        f"【歌词片段】\n{lyrics_text}\n\n"
+                    )
+                    
+                    yield event.chain_result([
+                        Comp.Plain(intro_text),
+                        Comp.Image(file=options_img_path)
+                    ])
+                else:
+                    lyrics_img = await asyncio.to_thread(
+                        self.image_generator.create_lyrics_image, game_data.lyrics_snippet
+                    )
+                    if not lyrics_img:
+                        yield event.plain_result("生成歌词图片时出错，请稍后再试。")
+                        break
+                    
+                    lyrics_img_path = self.image_generator.save_image(lyrics_img, self.output_dir, "lyrics")
+                    if not lyrics_img_path:
+                        yield event.plain_result("保存图片时出错，请稍后再试。")
+                        break
+                    
+                    intro_text = (
+                        f"请在{timeout_seconds}秒内输入数字(1-10)选择正确答案~\n"
+                        f"每位玩家最多可回答{max_attempts_per_player}次，全局共{max_attempts_total}次机会\n\n"
+                        f"歌词片段：\n"
+                    )
+                    
+                    yield event.chain_result([
+                        Comp.Plain(intro_text),
+                        Comp.Image(file=lyrics_img_path),
+                        Comp.Image(file=options_img_path)
+                    ])
+                
+                answered_correctly = False
+                final_answer_user_id = None
+                final_answer_user_name = None
+                final_answer_index = None
+                all_answers_history = []
+                winners_list = []
+                first_correct_time = None
+                reward_valid_time = self.config.get("reward_valid_time", 0)
+                
+                logger.info(f"[歌词猜曲] 奖励有效时间配置: {reward_valid_time}秒")
+                
+                @session_waiter(timeout=timeout_seconds)
+                async def answer_waiter(controller: SessionController, answer_event: AstrMessageEvent):
+                    nonlocal answered_correctly, final_answer_user_id, final_answer_user_name, final_answer_index
+                    nonlocal all_answers_history, first_correct_time, winners_list
+                    
+                    answer_user_id = answer_event.get_sender_id()
+                    answer_text = answer_event.message_str.strip()
+                    
+                    # 处理退出自动模式
+                    if answer_text == "退出" and session_id in self.auto_sessions:
+                        self.auto_sessions.discard(session_id)
+                        if session_id in self.auto_stop_events:
+                            self.auto_stop_events[session_id].set()
+                        await answer_event.send(answer_event.plain_result("已退出自动模式，本局结束后将不再自动开局。"))
+                        return
+                    
+                    if not answer_text.isdigit():
+                        return
+                    
+                    try:
+                        selected_num = int(answer_text)
+                        if not (1 <= selected_num <= 10):
+                            return
+                    except ValueError:
+                        return
+                    
+                    player_current_attempts = game_session.player_attempts.get(answer_user_id, 0)
+                    if player_current_attempts >= max_attempts_per_player:
+                        return
+                    
+                    if game_session.total_attempts >= max_attempts_total:
+                        controller.stop()
+                        return
+                    
+                    game_session.total_attempts += 1
+                    game_session.player_attempts[answer_user_id] = player_current_attempts + 1
+                    
+                    all_answers_history.append({
+                        'user_id': answer_user_id,
+                        'user_name': answer_event.get_sender_name(),
+                        'selected_num': selected_num,
+                        'attempt_number': game_session.total_attempts
+                    })
+                    
+                    correct_index = game_session.game_data.correct_index + 1
+                    
+                    if selected_num == correct_index:
+                        current_time = time.time()
+                        
+                        if not answered_correctly:
+                            answered_correctly = True
+                            final_answer_user_id = answer_user_id
+                            final_answer_user_name = answer_event.get_sender_name()
+                            final_answer_index = selected_num
+                            first_correct_time = current_time
+                            winners_list.append({
+                                'user_id': answer_user_id,
+                                'user_name': answer_event.get_sender_name(),
+                                'answer_time': current_time,
+                                'is_first': True
+                            })
+                            
+                            if reward_valid_time > 0:
+                                logger.info(f"[歌词猜曲] 第一个答对者: {final_answer_user_name}，启动{reward_valid_time}秒奖励有效时间")
+                                async def stop_after_delay():
+                                    await asyncio.sleep(reward_valid_time)
+                                    controller.stop()
+                                asyncio.create_task(stop_after_delay())
+                            else:
+                                controller.stop()
+                        else:
+                            time_since_first_correct = current_time - first_correct_time
+                            if time_since_first_correct <= reward_valid_time and reward_valid_time > 0:
+                                if not any(w['user_id'] == answer_user_id for w in winners_list):
+                                    winners_list.append({
+                                        'user_id': answer_user_id,
+                                        'user_name': answer_event.get_sender_name(),
+                                        'answer_time': current_time,
+                                        'is_first': False
+                                    })
+                                    logger.info(f"[歌词猜曲] 奖励有效时间内额外答对: {answer_event.get_sender_name()} (+{time_since_first_correct:.2f}s)")
+                    else:
+                        if game_session.total_attempts >= max_attempts_total:
+                            controller.stop()
+                
+                try:
+                    await answer_waiter(event)
+                except TimeoutError:
+                    game_session.game_ended_by_timeout = True
+                
+                self.last_game_end_time[session_id] = time.time()
+                
+                correct_name = self.song_manager.get_display_name(game_session.game_data.correct_song)
+                correct_index = game_session.game_data.correct_index + 1
+                
+                if game_session.game_ended_by_timeout and not answered_correctly:
+                    result_text = f"⏰ 时间到！正确答案是 [{correct_index}] {correct_name}"
+                elif answered_correctly:
+                    if len(winners_list) == 1:
+                        result_text = (
+                            f"🎉 {final_answer_user_name} 答对了！获得1分！\n"
+                            f"正确答案是 [{correct_index}] {correct_name}\n"
+                        )
+                        self.db.update_user_game_result(final_answer_user_id, final_answer_user_name, 1, correct=True)
+                        
+                        for answer_record in all_answers_history:
+                            if answer_record['user_id'] != final_answer_user_id or answer_record['selected_num'] != correct_index:
+                                self.db.update_user_game_result(
+                                    answer_record['user_id'], 
+                                    answer_record['user_name'], 
+                                    0, 
+                                    correct=False
+                                )
+                    else:
+                        winner_names = [w['user_name'] for w in winners_list]
+                        result_text = (
+                            f"🎉 恭喜以下玩家答对！每人获得1分！\n"
+                            f"{'、'.join(winner_names)}\n\n"
+                            f"正确答案是 [{correct_index}] {correct_name}"
+                        )
+                        
+                        for winner in winners_list:
+                            self.db.update_user_game_result(
+                                winner['user_id'],
+                                winner['user_name'],
+                                1,
+                                correct=True
+                            )
+                        
+                        for answer_record in all_answers_history:
+                            if not any(w['user_id'] == answer_record['user_id'] for w in winners_list):
+                                self.db.update_user_game_result(
+                                    answer_record['user_id'],
+                                    answer_record['user_name'],
+                                    0,
+                                    correct=False
+                                )
+                else:
+                    result_text = (
+                        f"⚠️ 作答次数已全部用尽！\n"
+                        f"正确答案是 [{correct_index}] {correct_name}\n"
+                    )
+                    
+                    for answer_record in all_answers_history:
+                        self.db.update_user_game_result(
+                            answer_record['user_id'],
+                            answer_record['user_name'],
+                            0,
+                            correct=False
+                        )
+                
+                yield event.plain_result(result_text)
+                
+                correct_jacket_img = await asyncio.to_thread(
+                    self.song_manager.get_jacket_image, game_session.game_data.correct_song
+                )
+                if correct_jacket_img:
+                    jacket_path = self.output_dir / f"correct_jacket_{time.time_ns()}.png"
+                    correct_jacket_img.save(jacket_path)
+                    yield event.image_result(str(jacket_path))
+            
+            finally:
+                self.active_game_sessions.discard(session_id)
+                self.game_sessions.pop(session_id, None)
+            
+            # 判断是否继续自动模式
+            if not auto_mode:
+                break
+            
+            if session_id not in self.auto_sessions:
+                break
+            
+            yield event.plain_result("本局结束，3秒后自动开始下一局...发送「退出」可停止自动模式")
+            
+            if session_id not in self.auto_stop_events:
+                self.auto_stop_events[session_id] = asyncio.Event()
+            
+            try:
+                await asyncio.wait_for(self.auto_stop_events[session_id].wait(), timeout=3.0)
+                # 收到退出信号
+                break
+            except asyncio.TimeoutError:
+                pass
+            
+            first_round = False
+        
+        # 清理自动模式状态
+        if auto_mode:
+            self.auto_sessions.discard(session_id)
+            self.auto_stop_events.pop(session_id, None)
+
     @filter.command("歌词猜曲", alias={"pjsk歌词猜曲", "猜歌词", "歌词识曲", "歌词猜歌"})
     async def start_guess_lyrics(self, event: AstrMessageEvent):
         """开始歌词猜曲游戏"""
+        async for result in self._run_game_impl(event, auto_mode=False):
+            yield result
+    
+    @filter.command("自动歌词猜曲", alias={"pjsk自动歌词猜曲", "自动猜歌词"})
+    async def start_auto_guess_lyrics(self, event: AstrMessageEvent):
+        """开始自动歌词猜曲模式"""
         if not self.data_initialized:
             yield event.plain_result("数据正在初始化中，请稍后再试...")
             return
@@ -1267,285 +1625,29 @@ class GuessLyricsPlugin(Star):
         session_id = event.unified_msg_origin
         
         session_lock = await self._get_session_lock(session_id)
-        
         async with session_lock:
-            if session_id in self.active_game_sessions:
-                yield event.plain_result("当前已经有一个游戏在进行中啦~ 等它结束后再来玩吧！")
+            if session_id in self.active_game_sessions or session_id in self.auto_sessions:
+                yield event.plain_result("当前已经有一个游戏或自动模式在进行中啦~")
                 return
-            
-            cooldown_remaining = self._get_cooldown_remaining(session_id)
-            if cooldown_remaining > 0:
-                time_display = f"{cooldown_remaining:.1f}" if cooldown_remaining < 1 else str(int(cooldown_remaining))
-                yield event.plain_result(f"让我们休息一下吧！{time_display}秒后再来玩哦~ 😊")
-                return
-            
-            daily_limit = self.config.get("daily_play_limit", Config.DEFAULT_DAILY_LIMIT)
-            if not self.db.can_play_today(user_id, daily_limit):
-                yield event.plain_result(f"今天的游戏次数已经用完啦~ 明天再来玩吧！每天最多可以玩{daily_limit}次哦~ ✨")
-                return
-            
-            self.active_game_sessions.add(session_id)
+            self.auto_sessions.add(session_id)
+            self.auto_stop_events[session_id] = asyncio.Event()
         
-        try:
-            game_data = self.start_new_game()
-            if not game_data:
-                yield event.plain_result("开始游戏失败，可能存在歌词文件损坏或格式不正确，请联系管理员检查日志。")
-                return
-            
-            max_attempts_per_player = max(1, int(self.config.get("max_attempts_per_player", 1)))
-            max_attempts_total = max(1, int(self.config.get("max_attempts_total", 5)))
-            lyrics_display_mode = str(self.config.get("lyrics_display_mode", "image")).lower()
-            
-            if lyrics_display_mode not in ["image", "text"]:
-                logger.warning(f"Invalid lyrics_display_mode '{lyrics_display_mode}', defaulting to 'image'")
-                lyrics_display_mode = "image"
-            
-            async def load_single_jacket(opt):
-                """加载单个曲绘"""
-                jacket_img = await asyncio.to_thread(
-                    self.song_manager.get_jacket_image, opt
-                )
-                if jacket_img:
-                    temp_path = self.output_dir / f"temp_jacket_{opt.music_id}_{time.time_ns()}.png"
-                    jacket_img.save(temp_path)
-                    return str(temp_path)
-                return None
-            
-            jacket_tasks = [load_single_jacket(opt) for opt in game_data.options]
-            jacket_paths = await asyncio.gather(*jacket_tasks)
-            
-            options_with_images = [
-                (i + 1, opt.cn_title, opt.original_name, jacket_paths[i])
-                for i, opt in enumerate(game_data.options)
-            ]
-            
-            options_img = await asyncio.to_thread(
-                self.image_generator.create_options_image, options_with_images
-            )
-            if not options_img:
-                yield event.plain_result("生成选项图片时出错，请稍后再试。")
-                return
-            
-            options_img_path = self.image_generator.save_image(options_img, self.output_dir, "options")
-            
-            if not options_img_path:
-                yield event.plain_result("保存图片时出错，请稍后再试。")
-                return
-            
-            correct_display_name = self.song_manager.get_display_name(game_data.correct_song)
-            logger.info(f"[歌词猜曲插件] 新游戏开始. 答案: {correct_display_name}, 模式: {lyrics_display_mode}")
-            
-            game_session = GameSession(game_data=game_data)
-            self.game_sessions[session_id] = game_session
-            
-            timeout_seconds = self.config.get("answer_timeout", Config.DEFAULT_TIMEOUT)
-            
-            await asyncio.to_thread(self.db.update_user_play, user_id, event.get_sender_name())
-            
-            if lyrics_display_mode == "text":
-                lyrics_text = "\n".join(game_data.lyrics_snippet)
-                intro_text = (
-                    f"请在{timeout_seconds}秒内输入数字(1-10)选择正确答案~\n"
-                    f"每位玩家最多可回答{max_attempts_per_player}次，全局共{max_attempts_total}次机会\n\n"
-                    f"【歌词片段】\n{lyrics_text}\n\n"
-                )
-                
-                yield event.chain_result([
-                    Comp.Plain(intro_text),
-                    Comp.Image(file=options_img_path)
-                ])
-            else:
-                lyrics_img = await asyncio.to_thread(
-                    self.image_generator.create_lyrics_image, game_data.lyrics_snippet
-                )
-                if not lyrics_img:
-                    yield event.plain_result("生成歌词图片时出错，请稍后再试。")
-                    return
-                
-                lyrics_img_path = self.image_generator.save_image(lyrics_img, self.output_dir, "lyrics")
-                if not lyrics_img_path:
-                    yield event.plain_result("保存图片时出错，请稍后再试。")
-                    return
-                
-                intro_text = (
-                    f"请在{timeout_seconds}秒内输入数字(1-10)选择正确答案~\n"
-                    f"每位玩家最多可回答{max_attempts_per_player}次，全局共{max_attempts_total}次机会\n\n"
-                    f"歌词片段：\n"
-                )
-                
-                yield event.chain_result([
-                    Comp.Plain(intro_text),
-                    Comp.Image(file=lyrics_img_path),
-                    Comp.Image(file=options_img_path)
-                ])
-            
-            answered_correctly = False
-            final_answer_user_id = None
-            final_answer_user_name = None
-            final_answer_index = None
-            all_answers_history = []
-            winners_list = []  # 记录所有获奖者（用于奖励有效时间功能）
-            first_correct_time = None  # 记录第一个答对的时间
-            reward_valid_time = self.config.get("reward_valid_time", 0)  # 奖励有效时间配置
-            
-            logger.info(f"[歌词猜曲] 奖励有效时间配置: {reward_valid_time}秒")
-            
-            @session_waiter(timeout=timeout_seconds)
-            async def answer_waiter(controller: SessionController, answer_event: AstrMessageEvent):
-                nonlocal answered_correctly, final_answer_user_id, final_answer_user_name, final_answer_index
-                nonlocal all_answers_history, first_correct_time, winners_list
-                
-                answer_user_id = answer_event.get_sender_id()
-                answer_text = answer_event.message_str.strip()
-                
-                if not answer_text.isdigit():
-                    return
-                
-                try:
-                    selected_num = int(answer_text)
-                    if not (1 <= selected_num <= 10):
-                        return
-                except ValueError:
-                    return
-                
-                player_current_attempts = game_session.player_attempts.get(answer_user_id, 0)
-                if player_current_attempts >= max_attempts_per_player:
-                    return
-                
-                if game_session.total_attempts >= max_attempts_total:
-                    controller.stop()
-                    return
-                
-                game_session.total_attempts += 1
-                game_session.player_attempts[answer_user_id] = player_current_attempts + 1
-                
-                all_answers_history.append({
-                    'user_id': answer_user_id,
-                    'user_name': answer_event.get_sender_name(),
-                    'selected_num': selected_num,
-                    'attempt_number': game_session.total_attempts
-                })
-                
-                correct_index = game_session.game_data.correct_index + 1
-                
-                if selected_num == correct_index:
-                    current_time = time.time()
-                    
-                    if not answered_correctly:
-                        answered_correctly = True
-                        final_answer_user_id = answer_user_id
-                        final_answer_user_name = answer_event.get_sender_name()
-                        final_answer_index = selected_num
-                        first_correct_time = current_time
-                        winners_list.append({
-                            'user_id': answer_user_id,
-                            'user_name': answer_event.get_sender_name(),
-                            'answer_time': current_time,
-                            'is_first': True
-                        })
-                        
-                        if reward_valid_time > 0:
-                            logger.info(f"[歌词猜曲] 第一个答对者: {final_answer_user_name}，启动{reward_valid_time}秒奖励有效时间")
-                            async def stop_after_delay():
-                                await asyncio.sleep(reward_valid_time)
-                                controller.stop()
-                            asyncio.create_task(stop_after_delay())
-                        else:
-                            controller.stop()
-                    else:
-                        time_since_first_correct = current_time - first_correct_time
-                        if time_since_first_correct <= reward_valid_time and reward_valid_time > 0:
-                            if not any(w['user_id'] == answer_user_id for w in winners_list):
-                                winners_list.append({
-                                    'user_id': answer_user_id,
-                                    'user_name': answer_event.get_sender_name(),
-                                    'answer_time': current_time,
-                                    'is_first': False
-                                })
-                                logger.info(f"[歌词猜曲] 奖励有效时间内额外答对: {answer_event.get_sender_name()} (+{time_since_first_correct:.2f}s)")
-                else:
-                    if game_session.total_attempts >= max_attempts_total:
-                        controller.stop()
-            
-            try:
-                await answer_waiter(event)
-            except TimeoutError:
-                game_session.game_ended_by_timeout = True
-            
-            self.last_game_end_time[session_id] = time.time()
-            
-            correct_name = self.song_manager.get_display_name(game_session.game_data.correct_song)
-            correct_index = game_session.game_data.correct_index + 1
-            
-            if game_session.game_ended_by_timeout and not answered_correctly:
-                result_text = f"⏰ 时间到！正确答案是 [{correct_index}] {correct_name}"
-            elif answered_correctly:
-                if len(winners_list) == 1:
-                    result_text = (
-                        f"🎉 {final_answer_user_name} 答对了！获得1分！\n"
-                        f"正确答案是 [{correct_index}] {correct_name}\n"
-                    )
-                    self.db.update_user_game_result(final_answer_user_id, final_answer_user_name, 1, correct=True)
-                    
-                    for answer_record in all_answers_history:
-                        if answer_record['user_id'] != final_answer_user_id or answer_record['selected_num'] != correct_index:
-                            self.db.update_user_game_result(
-                                answer_record['user_id'], 
-                                answer_record['user_name'], 
-                                0, 
-                                correct=False
-                            )
-                else:
-                    winner_names = [w['user_name'] for w in winners_list]
-                    result_text = (
-                        f"🎉 恭喜以下玩家答对！每人获得1分！\n"
-                        f"{'、'.join(winner_names)}\n\n"
-                        f"正确答案是 [{correct_index}] {correct_name}"
-                    )
-                    
-                    for winner in winners_list:
-                        self.db.update_user_game_result(
-                            winner['user_id'],
-                            winner['user_name'],
-                            1,
-                            correct=True
-                        )
-                    
-                    for answer_record in all_answers_history:
-                        if not any(w['user_id'] == answer_record['user_id'] for w in winners_list):
-                            self.db.update_user_game_result(
-                                answer_record['user_id'],
-                                answer_record['user_name'],
-                                0,
-                                correct=False
-                            )
-            else:
-                result_text = (
-                    f"⚠️ 作答次数已全部用尽！\n"
-                    f"正确答案是 [{correct_index}] {correct_name}\n"
-                )
-                
-                for answer_record in all_answers_history:
-                    self.db.update_user_game_result(
-                        answer_record['user_id'],
-                        answer_record['user_name'],
-                        0,
-                        correct=False
-                    )
-            
-            yield event.plain_result(result_text)
-            
-            correct_jacket_img = await asyncio.to_thread(
-                self.song_manager.get_jacket_image, game_session.game_data.correct_song
-            )
-            if correct_jacket_img:
-                jacket_path = self.output_dir / f"correct_jacket_{time.time_ns()}.png"
-                correct_jacket_img.save(jacket_path)
-                yield event.image_result(str(jacket_path))
+        yield event.plain_result("🎮 自动歌词猜曲模式已开启！每局结束后将自动开始下一局，发送「退出」可随时停止。")
         
-        finally:
-            self.active_game_sessions.discard(session_id)
-            self.game_sessions.pop(session_id, None)
+        async for result in self._run_game_impl(event, auto_mode=True):
+            yield result
+
+    @filter.command("退出")
+    async def quit_auto_mode(self, event: AstrMessageEvent):
+        """退出自动歌词猜曲模式"""
+        session_id = event.unified_msg_origin
+        if session_id not in self.auto_sessions:
+            return
+        
+        self.auto_sessions.discard(session_id)
+        if session_id in self.auto_stop_events:
+            self.auto_stop_events[session_id].set()
+        yield event.plain_result("已退出自动歌词猜曲模式。")
     
     @filter.command("歌词猜曲帮助")
     async def show_help(self, event: AstrMessageEvent):
@@ -1564,6 +1666,7 @@ class GuessLyricsPlugin(Star):
             "🎵 PJSK 歌词猜曲指南 🎵\n\n"
             "【游戏指令】\n"
             "歌词猜曲 - 随机一首歌曲，展示歌词片段，猜出歌名！\n"
+            "自动歌词猜曲 - 开启自动模式，每局结束后自动开始下一局\n"
             "歌词猜曲分数 - 查看自己的游戏数据统计\n"
             "歌词猜曲排行榜 - 查看总分排行榜\n"
             "歌词猜曲自定义名称 [名称] - 设置你的个性化ID（不带参数可清除）\n\n"
@@ -1574,12 +1677,13 @@ class GuessLyricsPlugin(Star):
             "【管理员指令】\n"
             "刷新本地数据 - 重新加载本地翻译和别名数据\n\n"
             "【玩法说明】\n"
-            "1. 发送「歌词猜曲」开始游戏\n"
+            "1. 发送「歌词猜曲」开始游戏，或发送「自动歌词猜曲」开启自动模式\n"
             "2. 系统随机选择一首歌曲并展示歌词片段\n"
             "3. 在限时内输入数字(1-10)选择正确答案\n"
             "4. 每位玩家有独立的作答次数限制，全局也有总次数限制\n"
             "5. 任一限制触发或有人答对时，本轮结束\n"
-            "6. 答对获得1分，答错不计分但会消耗作答机会"
+            "6. 答对获得1分，答错不计分但会消耗作答机会\n"
+            "7. 自动模式下发送「退出」可随时停止自动开局"
         )
         yield event.plain_result(help_text)
     
