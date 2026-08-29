@@ -1511,6 +1511,10 @@ class GuessLyricsPlugin(Star):
             encoded_at_text=quote(at_text, safe=""),
         )
 
+    def _get_official_connect_id(self, event: AstrMessageEvent) -> str:
+        """返回官机连接模板的兼容 ID；默认 qqbot-cmd-input 不依赖该值。"""
+        return self._get_official_self_id(event) or "qq_official"
+
     def _get_official_self_id(self, event: AstrMessageEvent) -> str:
         return str(getattr(event.message_obj, "self_id", "") or "").strip()
 
@@ -1540,7 +1544,7 @@ class GuessLyricsPlugin(Star):
         lines = [f"本局题库服务器：{SERVER_LABELS[server]}"]
 
         if self._get_event_platform_name(event) == OFFICIAL_PLATFORM_NAME:
-            self_id = self._get_official_self_id(event)
+            self_id = self._get_official_connect_id(event)
             if self_id:
                 lines.append(self._build_connect_link(connect_switch_cmd, self_id))
                 account_links = ["歌词猜曲绑定QQ", "歌词猜曲个人分数", "歌词猜曲排行榜"]
@@ -1867,19 +1871,27 @@ class GuessLyricsPlugin(Star):
                     f"每位玩家最多可回答{max_attempts_per_player}次，全局共{max_attempts_total}次机会\n\n"
                 )
                 in_auto_mode = session_id in self.auto_sessions
-                official_self_id = self._get_official_self_id(event) if is_official_round else ""
+                official_self_id = self._get_official_connect_id(event) if is_official_round else ""
                 # 自动模式不出现 markdown 按钮；仅手动局的官机消息附连接
                 use_markdown_intro = (not in_auto_mode) and bool(official_self_id)
-                if in_auto_mode:
+                if is_official_round:
+                    if in_auto_mode:
+                        quit_tail = (
+                            "\n"
+                            + self._build_connect_link("退出本局", official_self_id)
+                            + "  "
+                            + self._build_connect_link("退出自动模式", official_self_id)
+                        )
+                    else:
+                        quit_tail = (
+                            "\n"
+                            + self._build_connect_link("退出本局", official_self_id)
+                        )
+                elif in_auto_mode:
                     quit_tail = "\n发送「退出」可结束自动模式，发送「退出本局」可提前结束这一局。"
-                elif use_markdown_intro:
-                    quit_tail = (
-                        "\n"
-                        + self._build_connect_link("仅退出本局", official_self_id)
-                    )
                 else:
                     quit_tail = "\n发送「退出本局」可提前结束这一局。"
-                if use_markdown_intro:
+                if is_official_round:
                     if lyrics_display_mode == "text":
                         lyrics_text = "\n".join(game_data.lyrics_snippet)
                         intro_text = (
