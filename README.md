@@ -8,7 +8,7 @@
 - 🔄 **题库自动同步**：歌名、中文译名与别名自 Haruki master 每 24 小时自动同步，新歌随游戏版本更新自动入库（可猜曲目 = 本地歌词库 ∩ 对应服务器曲目）
 - 🌐 **多服务器题库**：支持日服 / 国服题库自由切换，按群独立记忆
 - 🏆 **精美数据面板**：内置积分排行榜（Pillow 本地渲染横向表格，与猜卡面同款视觉规范，支持自定义名称、未绑定 QQ 徽章）、个人战绩查询、每日次数限制与冷却
-- 🤖 **QQ 官方机器人支持**：官机 markdown 渲染，开局附操作连接，结算附切换题库/绑定/查分/排行榜连接与快捷入口；支持绑定普通 QQ 迁移分数
+- 🤖 **QQ 官方机器人支持**：官机 markdown 渲染，开局附操作连接，结算附切换题库/绑定/查分/排行榜连接；快捷入口由 `quick_entries` 配置控制（默认关闭）；支持绑定普通 QQ 迁移分数
 - ⚡ **双模式退出**：`仅退出本局` 与 `退出自动模式` 严格分离，自动模式精简无扰
 - 👥 **双重作答机制**：支持玩家个人作答次数限制与全局总次数限制协同工作
 
@@ -58,6 +58,9 @@
 | `default_server` | string | `jp` | 默认题库服务器（`jp`=日服 / `sc`=国服） |
 | `update_interval_hours` | int | `24` | master 题库自动更新间隔（小时） |
 | `connect_link_template` | string | （官方标签） | QQ 官方机器人结算连接的 markdown 模板 |
+| `quick_entries` | list | `[]` | 结算快捷入口列表（若为空则不显示快捷入口） |
+| `jp_resource_url_base` | string | `https://storage.exmeaning.com/sekai-jp-assets` | 日服曲绘资源根地址 |
+| `sc_resource_url_base` | string | `https://storage.exmeaning.com/sekai-sc-assets` | 国服曲绘资源根地址 |
 | `answer_timeout` | int | `30` | 答题超时时间（秒） |
 | `daily_play_limit` | int | `10` | 每日游戏次数上限（-1 为无限制） |
 | `game_cooldown_seconds` | int | `30` | 游戏冷却时间（秒） |
@@ -78,7 +81,8 @@
 - 中文译名：`translation.exmeaning.com`（Moesekai 翻译源）
 - 歌曲别名：`moe.exmeaning.com/data/music_alias`（Moesekai 别名源）
 - 歌词数据：网易云音乐（本地歌词库）
-- 曲绘图片：`snowyassets.exmeaning.com`
+- 日服曲绘资源：`https://storage.exmeaning.com/sekai-jp-assets/music/jacket`
+- 国服曲绘资源：`https://storage.exmeaning.com/sekai-sc-assets/music/jacket`
 
 优先走 GitHub Contents API，失败时回退 jsDelivr CDN。数据持久化于 `data/plugin_data/pjsk_guess_lyrics/`。
 
