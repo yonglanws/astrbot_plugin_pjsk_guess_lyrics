@@ -1,4 +1,26 @@
 {
+  "default_server": {
+    "description": "默认题库服务器",
+    "type": "string",
+    "options": [
+      "jp",
+      "sc"
+    ],
+    "default": "jp",
+    "hint": "jp=日服题库（haruki-sekai-master），sc=国服题库（haruki-sekai-sc-master）。群内可用指令临时切换。"
+  },
+  "update_interval_hours": {
+    "description": "题库自动更新间隔（小时）",
+    "type": "int",
+    "default": 24,
+    "hint": "master 题库每 24 小时自动检查一次，仅在游戏数据版本变化时重新下载大文件。"
+  },
+  "connect_link_template": {
+    "description": "指令连接的 markdown 模板（仅QQ官方机器人）",
+    "type": "string",
+    "default": "<qqbot-cmd-input text=\"{encoded_command}\" show=\"{encoded_name}\" />",
+    "hint": "结算消息中连接入口的 markdown 模板（QQ 官方 markdown 参数指令标签，点击后自动在聊天框填入指令，QQ 客户端发送时自动 @ 官机）。占位符：{name}=显示名，{command}=指令原文，{self_id}=官机ID，{at_text}=@官机+指令，{encoded_name}/{encoded_command}/{encoded_at_text}=对应 URL 编码。清空该配置则退回纯文本“（连接：@官机 指令）”形式。"
+  },
   "answer_timeout": {
     "description": "答题时长（秒）",
     "type": "int",
