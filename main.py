@@ -1876,8 +1876,6 @@ class GuessLyricsPlugin(Star):
                     quit_tail = (
                         "\n"
                         + self._build_connect_link("仅退出本局", official_self_id)
-                        + "  "
-                        + self._build_connect_link("退出自动模式", official_self_id)
                     )
                 else:
                     quit_tail = "\n发送「退出本局」可提前结束这一局。"
