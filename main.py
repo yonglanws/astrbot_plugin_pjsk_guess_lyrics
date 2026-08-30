@@ -60,7 +60,7 @@ except ImportError:
 PLUGIN_NAME = "pjsk_guess_lyrics"
 PLUGIN_AUTHOR = "慵懒午睡"
 PLUGIN_DESCRIPTION = "PJSK歌词猜曲插件"
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.1.1"
 PLUGIN_REPO_URL = "https://github.com/yonglanws/astrbot_plugin_pjsk_guess_lyrics"
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
@@ -621,47 +621,63 @@ class ImageGenerator:
             text = text[:-1]
         return text
     
+    @staticmethod
+    def _lyrics_pairs(lyrics_lines: List[str]) -> List[Tuple[str, str]]:
+        """将资源中交替排列的原文与中文译文分组。"""
+        return [
+            (lyrics_lines[index], lyrics_lines[index + 1] if index + 1 < len(lyrics_lines) else "")
+            for index in range(0, len(lyrics_lines), 2)
+        ]
+
     def create_lyrics_image(self, lyrics_lines: List[str]) -> Optional[Image.Image]:
-        """创建歌词图片（白色色调，日文中文交替显示）"""
+        """创建歌词图片（白色色调，原文与中文译文交替显示）"""
         try:
-            if not lyrics_lines:
+            lyric_pairs = self._lyrics_pairs(lyrics_lines)
+            if not lyric_pairs:
                 return None
-            
+
             colors = Config.Color
             padding = 50
             line_spacing = 8
             jp_cn_gap = 4
-            
+
             dummy_draw = ImageDraw.Draw(Image.new('RGB', (1, 1)))
             max_text_width = 0
-            for line in lyrics_lines:
-                bbox = dummy_draw.textbbox((0, 0), line, font=self.lyrics_jp_font)
-                text_width = bbox[2] - bbox[0]
-                max_text_width = max(max_text_width, text_width)
-            
+            for original, translation in lyric_pairs:
+                for line, font in ((original, self.lyrics_jp_font), (translation, self.lyrics_cn_font)):
+                    if line:
+                        bbox = dummy_draw.textbbox((0, 0), line, font=font)
+                        max_text_width = max(max_text_width, bbox[2] - bbox[0])
+
             img_width = min(Config.Image.MAX_WIDTH, max_text_width + padding * 2)
-            
             jp_height = Config.Image.FontSize.LYRICS_JP
             cn_height = Config.Image.FontSize.LYRICS_CN
             pair_height = jp_height + cn_height + jp_cn_gap + line_spacing
-            img_height = len(lyrics_lines) * pair_height + padding * 2 + 80
-            
+            img_height = len(lyric_pairs) * pair_height + padding * 2 + 80
+
             img = Image.new('RGB', (img_width, img_height), colors.BG_WHITE)
             draw = ImageDraw.Draw(img)
-            
             title = "歌词片段"
             title_width = self._get_text_width(draw, title, self.title_font)
             draw.text(((img_width - title_width) // 2, 20), title, font=self.title_font, fill=colors.TEXT_ACCENT)
-            
-            for i, line in enumerate(lyrics_lines):
-                y = padding + 60 + i * pair_height
-                
-                text_width = self._get_text_width(draw, line, self.lyrics_jp_font)
-                x = (img_width - text_width) // 2
-                
-                draw.text((x, y), line, font=self.lyrics_jp_font, fill=colors.TEXT_JP)
-                
-               
+
+            for index, (original, translation) in enumerate(lyric_pairs):
+                y = padding + 60 + index * pair_height
+                original_width = self._get_text_width(draw, original, self.lyrics_jp_font)
+                draw.text(
+                    ((img_width - original_width) // 2, y),
+                    original,
+                    font=self.lyrics_jp_font,
+                    fill=colors.TEXT_JP,
+                )
+                if translation:
+                    translation_width = self._get_text_width(draw, translation, self.lyrics_cn_font)
+                    draw.text(
+                        ((img_width - translation_width) // 2, y + jp_height + jp_cn_gap),
+                        translation,
+                        font=self.lyrics_cn_font,
+                        fill=colors.TEXT_GRAY,
+                    )
             return img
         except (IOError, OSError, ValueError, KeyError) as e:
             logger.error(f"Failed to create lyrics image: {e}")
@@ -762,8 +778,8 @@ class ImageGenerator:
             path = Path(cover_path)
             if not path.exists():
                 return
-            cover_img = Image.open(path)
-            cover_img = cover_img.resize((grid.COVER_SIZE, grid.COVER_SIZE), LANCZOS)
+            with Image.open(path) as source:
+                cover_img = source.resize((grid.COVER_SIZE, grid.COVER_SIZE), LANCZOS)
             
             cover_x = card_x + grid.CARD_WIDTH - grid.COVER_SIZE - grid.CARD_PADDING
             cover_y = card_y + (grid.CARD_HEIGHT - grid.COVER_SIZE) // 2
@@ -1195,15 +1211,13 @@ class DatabaseManager:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                """INSERT INTO user_stats (user_id, user_name, platform_name, score, attempts, correct_attempts, last_play_date, daily_plays)
-                   VALUES (?, ?, ?, ?, 1, ?, ?, 1)
+                """INSERT INTO user_stats (user_id, user_name, platform_name, score, attempts, correct_attempts, last_play_date)
+                   VALUES (?, ?, ?, ?, 1, ?, ?)
                    ON CONFLICT(user_id) DO UPDATE SET
                        score = score + excluded.score,
                        attempts = attempts + 1,
                        correct_attempts = correct_attempts + excluded.correct_attempts,
-                       user_name = excluded.user_name,
-                       last_play_date = excluded.last_play_date,
-                       daily_plays = CASE WHEN last_play_date = excluded.last_play_date THEN daily_plays + 1 ELSE 1 END
+                       user_name = excluded.user_name
                 """,
                     (user_id, user_name, platform_name, score, 1 if correct else 0, today)
             )
@@ -1391,9 +1405,11 @@ class GuessLyricsPlugin(Star):
         
         self.active_game_sessions: set = set()
         self.game_sessions: Dict[str, GameSession] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
-        self.session_locks: Dict[str, asyncio.Lock] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
+        self.session_locks: Dict[str, asyncio.Lock] = {}
         self.last_game_end_time: Dict[str, float] = LRUDict(max_size=Config.MAX_SESSION_CACHE_SIZE)
         self._lock_creation_lock = asyncio.Lock()
+        self._background_tasks: set[asyncio.Task] = set()
+        self._stopping = False
         self.song_manager: Optional[LocalSongManager] = None
         self.data_initialized = False
 
@@ -1410,18 +1426,27 @@ class GuessLyricsPlugin(Star):
         self.master_data.on_songs_updated = self._on_master_updated
 
         self._cleanup_output_dir()
-        self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
-        self._init_task = asyncio.create_task(self._initialize_data())
-        self._master_task = asyncio.create_task(self._start_master_data())
+        self._cleanup_task = self._track_task(asyncio.create_task(self._periodic_cleanup()))
+        self._init_task = self._track_task(asyncio.create_task(self._initialize_data()))
+        self._master_task = self._track_task(asyncio.create_task(self._start_master_data()))
 
         logger.info(f"PJSK Guess Lyrics Plugin initialized (v{PLUGIN_VERSION})")
 
     # --- 题库服务器与 master 数据同步 ---
 
+    def _track_task(self, task: asyncio.Task) -> asyncio.Task:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     async def _start_master_data(self):
         """启动歌曲题库自动同步服务。"""
+        if self._stopping:
+            return
         try:
             await self.master_data.start()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"题库同步服务启动失败: {e}", exc_info=True)
 
@@ -1696,6 +1721,23 @@ class GuessLyricsPlugin(Star):
                 self.session_locks[session_id] = asyncio.Lock()
             return self.session_locks[session_id]
     
+    async def _record_game_result(
+        self,
+        user_id: str,
+        user_name: str,
+        score: int,
+        correct: bool,
+        platform_name: str,
+    ) -> None:
+        await asyncio.to_thread(
+            self.db.update_user_game_result,
+            user_id,
+            user_name,
+            score,
+            correct,
+            platform_name,
+        )
+
     def start_new_game(self, pool: Optional[List[SongInfo]] = None) -> Optional[GameData]:
         """开始新游戏（可指定题库曲池，默认全部本地歌曲）"""
         if not self.song_manager:
@@ -1796,7 +1838,9 @@ class GuessLyricsPlugin(Star):
                         return
                 
                 daily_limit = self.config.get("daily_play_limit", Config.DEFAULT_DAILY_LIMIT)
-                if not self.db.can_play_today(user_id, daily_limit, platform_name):
+                if not await asyncio.to_thread(
+                    self.db.can_play_today, user_id, daily_limit, platform_name
+                ):
                     if auto_mode:
                         yield event.plain_result(f"今天的游戏次数已经用完啦~ 自动模式已停止！每天最多可以玩{daily_limit}次哦~ ✨")
                         break
@@ -1827,8 +1871,11 @@ class GuessLyricsPlugin(Star):
                     )
                     if jacket_img:
                         temp_path = self.output_dir / f"temp_jacket_{opt.music_id}_{time.time_ns()}.png"
-                        jacket_img.save(temp_path)
-                        return str(temp_path)
+                        try:
+                            await asyncio.to_thread(jacket_img.save, temp_path)
+                            return str(temp_path)
+                        finally:
+                            jacket_img.close()
                     return None
                 
                 jacket_tasks = [load_single_jacket(opt) for opt in game_data.options]
@@ -1846,7 +1893,10 @@ class GuessLyricsPlugin(Star):
                     yield event.plain_result("生成选项图片时出错，请稍后再试。")
                     break
                 
-                options_img_path = self.image_generator.save_image(options_img, self.output_dir, "options")
+                options_img_path = await asyncio.to_thread(
+                    self.image_generator.save_image, options_img, self.output_dir, "options"
+                )
+                options_img.close()
                 
                 if not options_img_path:
                     yield event.plain_result("保存图片时出错，请稍后再试。")
@@ -1872,8 +1922,6 @@ class GuessLyricsPlugin(Star):
                 )
                 in_auto_mode = session_id in self.auto_sessions
                 official_self_id = self._get_official_connect_id(event) if is_official_round else ""
-                # 自动模式不出现 markdown 按钮；仅手动局的官机消息附连接
-                use_markdown_intro = (not in_auto_mode) and bool(official_self_id)
                 if is_official_round:
                     if in_auto_mode:
                         quit_tail = (
@@ -1917,7 +1965,10 @@ class GuessLyricsPlugin(Star):
                             yield event.plain_result("生成歌词图片时出错，请稍后再试。")
                             break
 
-                        lyrics_img_path = self.image_generator.save_image(lyrics_img, self.output_dir, "lyrics")
+                        lyrics_img_path = await asyncio.to_thread(
+                            self.image_generator.save_image, lyrics_img, self.output_dir, "lyrics"
+                        )
+                        lyrics_img.close()
                         if not lyrics_img_path:
                             yield event.plain_result("保存图片时出错，请稍后再试。")
                             break
@@ -2068,7 +2119,7 @@ class GuessLyricsPlugin(Star):
                                 async def stop_after_delay():
                                     await asyncio.sleep(reward_valid_time)
                                     controller.stop()
-                                asyncio.create_task(stop_after_delay())
+                                self._track_task(asyncio.create_task(stop_after_delay()))
                             else:
                                 controller.stop()
                         else:
@@ -2106,7 +2157,7 @@ class GuessLyricsPlugin(Star):
 
                     # 超时局中已提交的作答同样要记为失败尝试，否则正确率统计会虚高
                     for answer_record in all_answers_history:
-                        self.db.update_user_game_result(
+                        await self._record_game_result(
                             answer_record['user_id'],
                             answer_record['user_name'],
                             0,
@@ -2119,7 +2170,7 @@ class GuessLyricsPlugin(Star):
                             f"🎉 {final_answer_user_name} 答对了！获得1分！\n"
                             f"正确答案是 [{correct_index}] {correct_name}\n"
                         )
-                        self.db.update_user_game_result(
+                        await self._record_game_result(
                             final_answer_user_id,
                             final_answer_user_name,
                             1,
@@ -2133,7 +2184,7 @@ class GuessLyricsPlugin(Star):
                             ) != (
                                 final_answer_user_id, final_answer_platform_name
                             ) or answer_record['selected_num'] != correct_index:
-                                self.db.update_user_game_result(
+                                await self._record_game_result(
                                     answer_record['user_id'], 
                                     answer_record['user_name'], 
                                     0, 
@@ -2149,7 +2200,7 @@ class GuessLyricsPlugin(Star):
                         )
                         
                         for winner in winners_list:
-                            self.db.update_user_game_result(
+                            await self._record_game_result(
                                 winner['user_id'],
                                 winner['user_name'],
                                 1,
@@ -2163,7 +2214,7 @@ class GuessLyricsPlugin(Star):
                                 and w.get('platform_name') == answer_record['platform_name']
                                 for w in winners_list
                             ):
-                                self.db.update_user_game_result(
+                                await self._record_game_result(
                                     answer_record['user_id'],
                                     answer_record['user_name'],
                                     0,
@@ -2178,7 +2229,7 @@ class GuessLyricsPlugin(Star):
 
                     # 退出局中已提交的作答同样要记为失败尝试，否则正确率统计会虚高
                     for answer_record in all_answers_history:
-                        self.db.update_user_game_result(
+                        await self._record_game_result(
                             answer_record['user_id'],
                             answer_record['user_name'],
                             0,
@@ -2192,7 +2243,7 @@ class GuessLyricsPlugin(Star):
                     )
 
                     for answer_record in all_answers_history:
-                        self.db.update_user_game_result(
+                        await self._record_game_result(
                             answer_record['user_id'],
                             answer_record['user_name'],
                             0,
@@ -2224,7 +2275,7 @@ class GuessLyricsPlugin(Star):
             finally:
                 self.active_game_sessions.discard(session_id)
                 self.game_sessions.pop(session_id, None)
-            
+
             # 判断是否继续自动模式
             if not auto_mode:
                 break
@@ -2260,6 +2311,7 @@ class GuessLyricsPlugin(Star):
         if auto_mode:
             self.auto_sessions.discard(session_id)
             self.auto_stop_events.pop(session_id, None)
+        self.session_locks.pop(session_id, None)
 
     @filter.command("歌词猜曲", alias={"pjsk歌词猜曲", "猜歌词", "歌词识曲", "歌词猜歌"})
     async def start_guess_lyrics(self, event: AstrMessageEvent):
@@ -2588,24 +2640,18 @@ class GuessLyricsPlugin(Star):
                 yield event.plain_result("你还没有参与过游戏哦~ 🎮")
     
     async def terminate(self):
-        """插件终止时的清理"""
+        """插件终止时取消任务并关闭外部资源。"""
         logger.info("Closing PJSK Guess Lyrics Plugin...")
+        self._stopping = True
 
-        if hasattr(self, '_cleanup_task') and not self._cleanup_task.done():
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
+        tasks = [task for task in self._background_tasks if task is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        self.session_locks.clear()
 
-        if hasattr(self, '_init_task') and not self._init_task.done():
-            self._init_task.cancel()
-            try:
-                await self._init_task
-            except asyncio.CancelledError:
-                pass
-
-        # 停止题库自动同步服务
         try:
             await self.master_data.terminate()
         except Exception as e:

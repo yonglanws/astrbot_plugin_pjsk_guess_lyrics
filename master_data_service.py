@@ -127,6 +127,7 @@ class MasterDataService:
                     self._save_meta()
         if loaded_any:
             logger.info("[PJSK歌词猜曲] 本地题库加载完成。")
+            self._notify_updated()
 
         self._update_task = asyncio.create_task(self._update_loop())
 
@@ -202,11 +203,12 @@ class MasterDataService:
             ]
 
             updated = False
+            extras_updated = False
             # 先更新共用补充数据（别名/翻译），重建派生数据时才能带上它们
             if stale_extras:
                 try:
-                    await self._update_extras(stale_extras)
-                    updated = True
+                    extras_updated = await self._update_extras(stale_extras)
+                    updated = updated or extras_updated
                 except Exception as e:
                     logger.error(
                         f"[PJSK歌词猜曲] 补充数据（别名/翻译）更新失败: {e}",
@@ -222,6 +224,19 @@ class MasterDataService:
                         f"[PJSK歌词猜曲] {SERVER_LABELS[server]}题库更新失败: {e}",
                         exc_info=True,
                     )
+
+            if extras_updated:
+                for server in (SERVER_JP, SERVER_SC):
+                    if not self.songs.get(server):
+                        continue
+                    try:
+                        if self._rebuild_from_local(server):
+                            updated = True
+                    except Exception as e:
+                        logger.warning(
+                            f"[PJSK歌词猜曲] {SERVER_LABELS[server]}补充数据重建失败: {e}",
+                            exc_info=True,
+                        )
 
             if updated:
                 self._save_meta()
@@ -343,20 +358,23 @@ class MasterDataService:
 
     # ---------- 补充数据（别名 / 翻译） ----------
 
-    async def _update_extras(self, keys: list[str]):
-        """逐个更新补充数据；单个失败不影响其余，全部失败才抛异常。"""
+    async def _update_extras(self, keys: list[str]) -> bool:
+        """更新补充数据，返回至少一个数据源是否成功刷新。"""
         errors = []
+        updated = False
         for key in keys:
             try:
                 raw = await self._fetch_url(_EXTRA_SOURCES[key])
                 self._store_extra(key, json.loads(raw.decode("utf-8")), update_meta=True)
+                updated = True
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 errors.append(f"{key}: {e}")
                 logger.warning(f"[PJSK歌词猜曲] 拉取 {key} 数据失败: {e}")
-        if len(errors) == len(keys):
+        if not updated:
             raise RuntimeError("全部补充数据拉取失败: " + "; ".join(errors))
+        return updated
 
     def _store_extra(self, key: str, data, update_meta: bool = False):
         if key == "translation":
