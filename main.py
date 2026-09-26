@@ -60,7 +60,7 @@ except ImportError:
 PLUGIN_NAME = "pjsk_guess_lyrics"
 PLUGIN_AUTHOR = "慵懒午睡"
 PLUGIN_DESCRIPTION = "PJSK歌词猜曲插件"
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.3.1"
 PLUGIN_REPO_URL = "https://github.com/yonglanws/astrbot_plugin_pjsk_guess_lyrics"
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
@@ -2427,7 +2427,28 @@ class GuessLyricsPlugin(Star):
         """切换为日服题库。"""
         await self._switch_server(event, SERVER_JP)
 
-    @filter.command("歌词猜曲绑定", alias={"pjsk歌词猜曲绑定", "歌词猜曲绑定QQ"})
+    @filter.command(
+        "歌词猜曲绑定",
+        alias={
+            "pjsk歌词猜曲绑定",
+            "歌词猜曲绑定QQ",
+            "歌词猜曲绑定qq",
+            "pjsk歌词猜曲绑定QQ",
+            "pjsk歌词猜曲绑定qq",
+            "猜歌词绑定",
+            "猜歌词绑定QQ",
+            "猜歌词绑定qq",
+            "歌词识曲绑定",
+            "歌词识曲绑定QQ",
+            "歌词识曲绑定qq",
+            "歌词猜歌绑定",
+            "歌词猜歌绑定QQ",
+            "歌词猜歌绑定qq",
+            "歌词绑定",
+            "歌词绑定QQ",
+            "歌词绑定qq",
+        },
+    )
     async def bind_lyrics_account(self, event: AstrMessageEvent):
         """QQ 官方机器人账号绑定到普通 QQ 账号。"""
         if not self._is_qq_official_event(event):
@@ -2491,7 +2512,28 @@ class GuessLyricsPlugin(Star):
         else:
             yield event.plain_result("绑定失败：该官方账号可能已绑定，请稍后重试。")
 
-    @filter.command("歌词猜曲解绑", alias={"pjsk歌词猜曲解绑", "歌词猜曲解绑QQ"})
+    @filter.command(
+        "歌词猜曲解绑",
+        alias={
+            "pjsk歌词猜曲解绑",
+            "歌词猜曲解绑QQ",
+            "歌词猜曲解绑qq",
+            "pjsk歌词猜曲解绑QQ",
+            "pjsk歌词猜曲解绑qq",
+            "猜歌词解绑",
+            "猜歌词解绑QQ",
+            "猜歌词解绑qq",
+            "歌词识曲解绑",
+            "歌词识曲解绑QQ",
+            "歌词识曲解绑qq",
+            "歌词猜歌解绑",
+            "歌词猜歌解绑QQ",
+            "歌词猜歌解绑qq",
+            "歌词解绑",
+            "歌词解绑QQ",
+            "歌词解绑qq",
+        },
+    )
     async def unbind_lyrics_account(self, event: AstrMessageEvent):
         """解除 QQ 官方机器人账号与普通 QQ 账号的绑定。"""
         if not self._is_qq_official_event(event):
