@@ -60,10 +60,11 @@ except ImportError:
 PLUGIN_NAME = "pjsk_guess_lyrics"
 PLUGIN_AUTHOR = "慵懒午睡"
 PLUGIN_DESCRIPTION = "PJSK歌词猜曲插件"
-PLUGIN_VERSION = "1.1.1"
+PLUGIN_VERSION = "1.2.0"
 PLUGIN_REPO_URL = "https://github.com/yonglanws/astrbot_plugin_pjsk_guess_lyrics"
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
+MAX_BINDINGS_PER_QQ = 2
 OFFICIAL_QID_PATTERN = re.compile(r"^[0-9a-fA-F]{32}$")
 
 # --- 题库服务器与官机 markdown 机制（与 PJSK Wordle 保持一致） ---
@@ -1085,6 +1086,16 @@ class DatabaseManager:
             ).fetchone()
         return str(row[0]) if row else str(user_id)
 
+    def count_qq_bindings(self, qq_user_id: str) -> int:
+        """统计某个普通 QQ 号已绑定的官方账号数量（上限 MAX_BINDINGS_PER_QQ）。"""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM account_bindings "
+                "WHERE official_platform = ? AND qq_user_id = ?",
+                (OFFICIAL_PLATFORM_NAME, str(qq_user_id).strip()),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
     def bind_official_account(self, official_user_id: str, qq_user_id: str) -> bool:
         """合并官方机器人账号在本插件内的历史数据并记录绑定关系。"""
         source_id = str(official_user_id).strip()
@@ -1099,6 +1110,15 @@ class DatabaseManager:
                     "SELECT 1 FROM account_bindings WHERE official_platform = ? AND official_user_id = ?",
                     (OFFICIAL_PLATFORM_NAME, source_id),
                 ).fetchone():
+                    conn.rollback()
+                    return False
+
+                bound_count = conn.execute(
+                    "SELECT COUNT(*) FROM account_bindings "
+                    "WHERE official_platform = ? AND qq_user_id = ?",
+                    (OFFICIAL_PLATFORM_NAME, target_id),
+                ).fetchone()
+                if int(bound_count[0] or 0) >= MAX_BINDINGS_PER_QQ:
                     conn.rollback()
                     return False
 
@@ -1164,7 +1184,33 @@ class DatabaseManager:
                 conn.rollback()
                 logger.error(f"绑定歌词猜曲官方机器人账号失败: {exc}", exc_info=True)
                 return False
-    
+
+    def unbind_official_account(self, official_user_id: str) -> bool:
+        """解除官方账号的绑定关系（只删绑定行，已迁移合并的历史分数不回退）。"""
+        source_id = str(official_user_id).strip()
+        if not source_id:
+            return False
+        with self._get_connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if not conn.execute(
+                    "SELECT 1 FROM account_bindings WHERE official_platform = ? AND official_user_id = ?",
+                    (OFFICIAL_PLATFORM_NAME, source_id),
+                ).fetchone():
+                    conn.rollback()
+                    return False
+                conn.execute(
+                    "DELETE FROM account_bindings WHERE official_platform = ? AND official_user_id = ?",
+                    (OFFICIAL_PLATFORM_NAME, source_id),
+                )
+                conn.commit()
+                self._invalidate_rank_cache()
+                return True
+            except Exception as exc:
+                conn.rollback()
+                logger.error(f"解绑歌词猜曲官方机器人账号失败: {exc}", exc_info=True)
+                return False
+
     def get_user_stats(self, user_id: str, platform_name: str = DEFAULT_PLATFORM_NAME) -> Optional[Tuple]:
         """获取用户统计"""
         with self._get_connection() as conn:
@@ -1572,7 +1618,7 @@ class GuessLyricsPlugin(Star):
             self_id = self._get_official_connect_id(event)
             if self_id:
                 lines.append(self._build_connect_link(connect_switch_cmd, self_id))
-                account_links = ["歌词猜曲绑定QQ", "歌词猜曲个人分数", "歌词猜曲排行榜"]
+                account_links = ["歌词猜曲绑定QQ", "歌词猜曲个人分数", "歌词猜曲排行榜", "歌词猜曲解绑QQ"]
                 lines.append(
                     "  ".join(self._build_connect_link(name, self_id) for name in account_links)
                 )
@@ -1633,11 +1679,14 @@ class GuessLyricsPlugin(Star):
         )
 
     @staticmethod
-    def _build_binding_confirmation_message(qq_user_id: str) -> str:
-        return (
-            f"你确认将账号绑定至  {qq_user_id} ？官方机作答的分数将迁移至该账号。\n"
-            "发送“确认”将开始绑定。发送“取消”将取消绑定。"
-        )
+    def _build_binding_confirmation_message(qq_user_id: str, bound_count: int = 0) -> str:
+        lines = [f"你确认将账号绑定至  {qq_user_id} ？官方机作答的分数将迁移至该账号。"]
+        if bound_count == 1:
+            lines.append(
+                "你已经绑定过一个官机了，你只能绑定两个官机，请确认你是否要绑定此账号。"
+            )
+        lines.append("发送“确认”将开始绑定。发送“取消”将取消绑定。")
+        return "\n".join(lines)
     
     def _ensure_directories(self):
         """确保必要的目录存在"""
@@ -2393,7 +2442,12 @@ class GuessLyricsPlugin(Star):
             yield event.plain_result(f"当前官方机器人账号已经绑定至 QQ号 {current_user_id}。")
             return
 
-        yield event.plain_result(self._build_binding_confirmation_message(qq_user_id))
+        bound_count = self.db.count_qq_bindings(qq_user_id)
+        if bound_count >= MAX_BINDINGS_PER_QQ:
+            yield event.plain_result("绑定失败：该QQ号已绑定两个官机账号，无法继续绑定。")
+            return
+
+        yield event.plain_result(self._build_binding_confirmation_message(qq_user_id, bound_count))
         decision = None
 
         @session_waiter(timeout=60)
@@ -2433,6 +2487,59 @@ class GuessLyricsPlugin(Star):
         else:
             yield event.plain_result("绑定失败：该官方账号可能已绑定，请稍后重试。")
 
+    @filter.command("歌词猜曲解绑", alias={"pjsk歌词猜曲解绑", "歌词猜曲解绑QQ"})
+    async def unbind_lyrics_account(self, event: AstrMessageEvent):
+        """解除 QQ 官方机器人账号与普通 QQ 账号的绑定。"""
+        if not self._is_qq_official_event(event):
+            yield event.plain_result("此解绑功能仅支持 QQ 官方机器人使用。")
+            return
+
+        official_user_id = str(event.get_sender_id())
+        current_user_id = self.db.resolve_user_id(OFFICIAL_PLATFORM_NAME, official_user_id)
+        if str(current_user_id) == official_user_id:
+            yield event.plain_result("当前官方机器人账号尚未绑定QQ号。")
+            return
+
+        yield event.plain_result(
+            f"你确认解除该官方机器人账号与 QQ号 {current_user_id} 的绑定？"
+            "已迁移的历史分数不会退回，绑定名额将释放。\n"
+            "发送“确认”将开始解绑。发送“取消”将取消解绑。"
+        )
+        decision = None
+
+        @session_waiter(timeout=60)
+        async def unbinding_waiter(controller: SessionController, answer_event: AstrMessageEvent):
+            nonlocal decision
+            answer_text = answer_event.message_str.strip()
+            if answer_text == "确认":
+                decision = "confirm"
+                controller.stop()
+            elif answer_text == "取消":
+                decision = "cancel"
+                controller.stop()
+
+        try:
+            await unbinding_waiter(
+                event,
+                session_filter=BindingSessionFilter(event.unified_msg_origin, official_user_id),
+            )
+        except TimeoutError:
+            yield event.plain_result("解绑确认已超时，解绑操作已取消。")
+            return
+
+        if decision == "cancel":
+            yield event.plain_result("已取消解绑。")
+            return
+        if decision != "confirm":
+            yield event.plain_result("未收到有效的解绑确认，解绑操作已取消。")
+            return
+
+        unbound = await asyncio.to_thread(self.db.unbind_official_account, official_user_id)
+        if unbound:
+            yield event.plain_result(f"解绑成功，该官方机器人账号已解除与 QQ号 {current_user_id} 的绑定。")
+        else:
+            yield event.plain_result("解绑失败，请稍后重试。")
+
     @filter.command("歌词猜曲帮助")
     async def show_help(self, event: AstrMessageEvent):
         """显示帮助信息"""
@@ -2454,7 +2561,8 @@ class GuessLyricsPlugin(Star):
             "歌词猜曲切换日服题库/歌词猜曲切换国服题库 - 切换题库服务器（下一局生效）\n"
             "歌词猜曲分数 - 查看自己的游戏数据统计\n"
             "歌词猜曲排行榜 - 查看总分排行榜\n"
-            "歌词猜曲绑定 QQ号 - QQ官方机器人绑定到你的QQ号，需发送“确认”\n"
+            "歌词猜曲绑定 QQ号 - QQ官方机器人绑定到你的QQ号，需发送“确认”（每个QQ号最多绑定两个官机）\n"
+            "歌词猜曲解绑 - 解除官方机与QQ号的绑定，需发送“确认”\n"
             "歌词猜曲自定义名称 [名称] - 设置你的个性化ID（不带参数可清除）\n\n"
             "【当前配置】\n"
             f"• 每位玩家每轮可作答: {max_attempts_per_player} 次\n"
