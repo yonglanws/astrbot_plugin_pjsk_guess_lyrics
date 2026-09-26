@@ -60,7 +60,7 @@ except ImportError:
 PLUGIN_NAME = "pjsk_guess_lyrics"
 PLUGIN_AUTHOR = "慵懒午睡"
 PLUGIN_DESCRIPTION = "PJSK歌词猜曲插件"
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.3.0"
 PLUGIN_REPO_URL = "https://github.com/yonglanws/astrbot_plugin_pjsk_guess_lyrics"
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
@@ -1975,6 +1975,8 @@ class GuessLyricsPlugin(Star):
                     if in_auto_mode:
                         quit_tail = (
                             "\n"
+                            + self._build_connect_link(" ", official_self_id, show="点击回答")
+                            + "  "
                             + self._build_connect_link("退出本局", official_self_id)
                             + "  "
                             + self._build_connect_link("退出自动模式", official_self_id)
@@ -1982,6 +1984,8 @@ class GuessLyricsPlugin(Star):
                     else:
                         quit_tail = (
                             "\n"
+                            + self._build_connect_link(" ", official_self_id, show="点击回答")
+                            + "  "
                             + self._build_connect_link("退出本局", official_self_id)
                         )
                 elif in_auto_mode:
