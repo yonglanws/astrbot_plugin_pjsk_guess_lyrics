@@ -1,4 +1,6 @@
 import asyncio
+import functools
+import inspect
 import json
 import random
 import time
@@ -60,8 +62,56 @@ except ImportError:
 PLUGIN_NAME = "pjsk_guess_lyrics"
 PLUGIN_AUTHOR = "慵懒午睡"
 PLUGIN_DESCRIPTION = "PJSK歌词猜曲插件"
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.5.1"
 PLUGIN_REPO_URL = "https://github.com/yonglanws/astrbot_plugin_pjsk_guess_lyrics"
+
+
+def _suppress_default_llm(event) -> None:
+    """阻止本条消息继续触发 AstrBot 默认的 LLM（人格角色扮演）回复。
+
+    只关闭默认 LLM 链路，不终止事件传播：娱乐插件之间存在同名指令别名
+    （如“退出”“切换国服题库”），其他插件的处理器仍需收到同一条消息。
+    """
+    should_call_llm = getattr(event, "should_call_llm", None)
+    if callable(should_call_llm):
+        # AstrBot 的语义：传入 True 表示禁止默认 LLM 请求
+        # （管线判断条件为 not event.call_llm）。
+        should_call_llm(True)
+    else:
+        # 极老版本没有该 API，退回终止事件传播。
+        event.stop_event()
+
+
+def _command(*args, **kwargs):
+    """注册指令处理器，并在调用时关闭默认 LLM 回复。
+
+    指令消息已经由插件自己回复；若不禁用默认 LLM 链路，AstrBot 在
+    @/唤醒消息上还会再走一遍人格对话，对同一条指令再回复一遍。
+    """
+
+    register_command = filter.command(*args, **kwargs)
+
+    def decorator(func):
+        if inspect.isasyncgenfunction(func):
+
+            @functools.wraps(func)
+            async def asyncgen_wrapper(self, event, *f_args, **f_kwargs):
+                _suppress_default_llm(event)
+                async for item in func(self, event, *f_args, **f_kwargs):
+                    yield item
+
+            return register_command(asyncgen_wrapper)
+
+        @functools.wraps(func)
+        async def coroutine_wrapper(self, event, *f_args, **f_kwargs):
+            _suppress_default_llm(event)
+            return await func(self, event, *f_args, **f_kwargs)
+
+        return register_command(coroutine_wrapper)
+
+    return decorator
+
+
 DEFAULT_PLATFORM_NAME = "aiocqhttp"
 OFFICIAL_PLATFORM_NAME = "qq_official"
 MAX_BINDINGS_PER_QQ = 2
@@ -2369,13 +2419,13 @@ class GuessLyricsPlugin(Star):
             self.auto_stop_events.pop(session_id, None)
         self.session_locks.pop(session_id, None)
 
-    @filter.command("歌词猜曲", alias={"pjsk歌词猜曲", "猜歌词", "歌词识曲", "歌词猜歌", "/歌词猜曲", "/pjsk歌词猜曲", "/猜歌词", "/歌词识曲", "/歌词猜歌"})
+    @_command("歌词猜曲", alias={"pjsk歌词猜曲", "猜歌词", "歌词识曲", "歌词猜歌", "/歌词猜曲", "/pjsk歌词猜曲", "/猜歌词", "/歌词识曲", "/歌词猜歌"})
     async def start_guess_lyrics(self, event: AstrMessageEvent):
         """开始歌词猜曲游戏"""
         async for result in self._run_game_impl(event, auto_mode=False):
             yield result
     
-    @filter.command("自动歌词猜曲", alias={"pjsk自动歌词猜曲", "自动猜歌词", "/自动歌词猜曲", "/pjsk自动歌词猜曲", "/自动猜歌词"})
+    @_command("自动歌词猜曲", alias={"pjsk自动歌词猜曲", "自动猜歌词", "/自动歌词猜曲", "/pjsk自动歌词猜曲", "/自动猜歌词"})
     async def start_auto_guess_lyrics(self, event: AstrMessageEvent):
         """开始自动歌词猜曲模式"""
         if not self.data_initialized:
@@ -2408,7 +2458,7 @@ class GuessLyricsPlugin(Star):
         async for result in self._run_game_impl(event, auto_mode=True):
             yield result
 
-    @filter.command("退出自动模式", alias={"退出", "/退出自动模式", "/退出"})
+    @_command("退出自动模式", alias={"退出", "/退出自动模式", "/退出"})
     async def quit_auto_mode(self, event: AstrMessageEvent):
         """退出自动歌词猜曲模式（本局进行中时由对局等待器处理）"""
         session_id = event.unified_msg_origin
@@ -2420,17 +2470,17 @@ class GuessLyricsPlugin(Star):
             self.auto_stop_events[session_id].set()
         yield event.plain_result("已退出自动歌词猜曲模式。")
     
-    @filter.command("歌词猜曲切换国服题库", alias={"歌词猜曲切换国服", "/歌词猜曲切换国服题库", "/歌词猜曲切换国服"})
+    @_command("歌词猜曲切换国服题库", alias={"歌词猜曲切换国服", "/歌词猜曲切换国服题库", "/歌词猜曲切换国服"})
     async def switch_to_sc(self, event: AstrMessageEvent):
         """切换为国服题库。"""
         await self._switch_server(event, SERVER_SC)
 
-    @filter.command("歌词猜曲切换日服题库", alias={"歌词猜曲切换日服", "/歌词猜曲切换日服题库", "/歌词猜曲切换日服"})
+    @_command("歌词猜曲切换日服题库", alias={"歌词猜曲切换日服", "/歌词猜曲切换日服题库", "/歌词猜曲切换日服"})
     async def switch_to_jp(self, event: AstrMessageEvent):
         """切换为日服题库。"""
         await self._switch_server(event, SERVER_JP)
 
-    @filter.command(
+    @_command(
         "歌词猜曲绑定",
         alias={
             "pjsk歌词猜曲绑定",
@@ -2533,7 +2583,7 @@ class GuessLyricsPlugin(Star):
         else:
             yield event.plain_result("绑定失败：该官方账号可能已绑定，请稍后重试。")
 
-    @filter.command(
+    @_command(
         "歌词猜曲解绑",
         alias={
             "pjsk歌词猜曲解绑",
@@ -2625,7 +2675,7 @@ class GuessLyricsPlugin(Star):
         else:
             yield event.plain_result("解绑失败，请稍后重试。")
 
-    @filter.command("歌词猜曲帮助", alias={"/歌词猜曲帮助"})
+    @_command("歌词猜曲帮助", alias={"/歌词猜曲帮助"})
     async def show_help(self, event: AstrMessageEvent):
         """显示帮助信息"""
         if not self._is_group_allowed(event):
@@ -2666,7 +2716,7 @@ class GuessLyricsPlugin(Star):
         )
         yield event.plain_result(help_text)
     
-    @filter.command("刷新本地数据", alias={"重载本地数据", "刷新数据", "/刷新本地数据", "/重载本地数据", "/刷新数据"})
+    @_command("刷新本地数据", alias={"重载本地数据", "刷新数据", "/刷新本地数据", "/重载本地数据", "/刷新数据"})
     async def reload_local_data(self, event: AstrMessageEvent):
         """刷新本地数据"""
         if not self._is_group_allowed(event):
@@ -2703,7 +2753,7 @@ class GuessLyricsPlugin(Star):
             logger.error(f"Failed to reload data: {e}")
             yield event.plain_result(f"刷新失败: {e}")
     
-    @filter.command("歌词猜曲分数", alias={"pjsk歌词猜曲分数", "猜歌词分数", "歌词猜曲查分", "歌词猜曲个人分数", "/歌词猜曲分数", "/pjsk歌词猜曲分数", "/猜歌词分数", "/歌词猜曲查分", "/歌词猜曲个人分数"})
+    @_command("歌词猜曲分数", alias={"pjsk歌词猜曲分数", "猜歌词分数", "歌词猜曲查分", "歌词猜曲个人分数", "/歌词猜曲分数", "/pjsk歌词猜曲分数", "/猜歌词分数", "/歌词猜曲查分", "/歌词猜曲个人分数"})
     async def show_user_score(self, event: AstrMessageEvent):
         """显示用户分数"""
         if not self._is_group_allowed(event):
@@ -2768,7 +2818,7 @@ class GuessLyricsPlugin(Star):
         
         yield event.plain_result(stats_text)
     
-    @filter.command("歌词猜曲排行榜", alias={"歌词猜曲排行", "pjsk歌词猜曲排行榜", "/歌词猜曲排行榜", "/歌词猜曲排行", "/pjsk歌词猜曲排行榜"})
+    @_command("歌词猜曲排行榜", alias={"歌词猜曲排行", "pjsk歌词猜曲排行榜", "/歌词猜曲排行榜", "/歌词猜曲排行", "/pjsk歌词猜曲排行榜"})
     async def show_ranking(self, event: AstrMessageEvent):
         """显示排行榜"""
         if not self._is_group_allowed(event):
@@ -2800,7 +2850,7 @@ class GuessLyricsPlugin(Star):
             logger.error(f"Failed to render ranking: {e}")
             yield event.plain_result("生成排行榜图片时出错。")
     
-    @filter.command("歌词猜曲自定义名称", alias={"歌词猜曲昵称", "歌词猜曲名称", "歌词猜曲起名", "/歌词猜曲自定义名称", "/歌词猜曲昵称", "/歌词猜曲名称", "/歌词猜曲起名"})
+    @_command("歌词猜曲自定义名称", alias={"歌词猜曲昵称", "歌词猜曲名称", "歌词猜曲起名", "/歌词猜曲自定义名称", "/歌词猜曲昵称", "/歌词猜曲名称", "/歌词猜曲起名"})
     async def set_custom_name(self, event: AstrMessageEvent):
         """设置自定义名称"""
         if not self._is_group_allowed(event):
