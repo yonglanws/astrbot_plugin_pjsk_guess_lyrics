@@ -2102,6 +2102,9 @@ class GuessLyricsPlugin(Star):
                     if self._is_event_user_blacklisted(answer_event, answer_user_id):
                         return
                     answer_text = answer_event.message_str.strip()
+                    if answer_text.startswith("/"):
+                        # 兼容 "/" 前缀指令别名（如 /退出）
+                        answer_text = answer_text[1:].strip()
 
                     # 仅退出本局：支持「仅退出本局」、「退出本局」；若非自动模式，发送「退出」也视为退出本局
                     if answer_text in ["仅退出本局", "退出本局"] or (answer_text == "退出" and session_id not in self.auto_sessions):
@@ -2366,13 +2369,13 @@ class GuessLyricsPlugin(Star):
             self.auto_stop_events.pop(session_id, None)
         self.session_locks.pop(session_id, None)
 
-    @filter.command("歌词猜曲", alias={"pjsk歌词猜曲", "猜歌词", "歌词识曲", "歌词猜歌"})
+    @filter.command("歌词猜曲", alias={"pjsk歌词猜曲", "猜歌词", "歌词识曲", "歌词猜歌", "/歌词猜曲", "/pjsk歌词猜曲", "/猜歌词", "/歌词识曲", "/歌词猜歌"})
     async def start_guess_lyrics(self, event: AstrMessageEvent):
         """开始歌词猜曲游戏"""
         async for result in self._run_game_impl(event, auto_mode=False):
             yield result
     
-    @filter.command("自动歌词猜曲", alias={"pjsk自动歌词猜曲", "自动猜歌词"})
+    @filter.command("自动歌词猜曲", alias={"pjsk自动歌词猜曲", "自动猜歌词", "/自动歌词猜曲", "/pjsk自动歌词猜曲", "/自动猜歌词"})
     async def start_auto_guess_lyrics(self, event: AstrMessageEvent):
         """开始自动歌词猜曲模式"""
         if not self.data_initialized:
@@ -2405,7 +2408,7 @@ class GuessLyricsPlugin(Star):
         async for result in self._run_game_impl(event, auto_mode=True):
             yield result
 
-    @filter.command("退出自动模式", alias={"退出"})
+    @filter.command("退出自动模式", alias={"退出", "/退出自动模式", "/退出"})
     async def quit_auto_mode(self, event: AstrMessageEvent):
         """退出自动歌词猜曲模式（本局进行中时由对局等待器处理）"""
         session_id = event.unified_msg_origin
@@ -2417,12 +2420,12 @@ class GuessLyricsPlugin(Star):
             self.auto_stop_events[session_id].set()
         yield event.plain_result("已退出自动歌词猜曲模式。")
     
-    @filter.command("歌词猜曲切换国服题库", alias={"歌词猜曲切换国服"})
+    @filter.command("歌词猜曲切换国服题库", alias={"歌词猜曲切换国服", "/歌词猜曲切换国服题库", "/歌词猜曲切换国服"})
     async def switch_to_sc(self, event: AstrMessageEvent):
         """切换为国服题库。"""
         await self._switch_server(event, SERVER_SC)
 
-    @filter.command("歌词猜曲切换日服题库", alias={"歌词猜曲切换日服"})
+    @filter.command("歌词猜曲切换日服题库", alias={"歌词猜曲切换日服", "/歌词猜曲切换日服题库", "/歌词猜曲切换日服"})
     async def switch_to_jp(self, event: AstrMessageEvent):
         """切换为日服题库。"""
         await self._switch_server(event, SERVER_JP)
@@ -2447,6 +2450,24 @@ class GuessLyricsPlugin(Star):
             "歌词绑定",
             "歌词绑定QQ",
             "歌词绑定qq",
+            "/歌词猜曲绑定",
+            "/pjsk歌词猜曲绑定",
+            "/歌词猜曲绑定QQ",
+            "/歌词猜曲绑定qq",
+            "/pjsk歌词猜曲绑定QQ",
+            "/pjsk歌词猜曲绑定qq",
+            "/猜歌词绑定",
+            "/猜歌词绑定QQ",
+            "/猜歌词绑定qq",
+            "/歌词识曲绑定",
+            "/歌词识曲绑定QQ",
+            "/歌词识曲绑定qq",
+            "/歌词猜歌绑定",
+            "/歌词猜歌绑定QQ",
+            "/歌词猜歌绑定qq",
+            "/歌词绑定",
+            "/歌词绑定QQ",
+            "/歌词绑定qq",
         },
     )
     async def bind_lyrics_account(self, event: AstrMessageEvent):
@@ -2532,6 +2553,24 @@ class GuessLyricsPlugin(Star):
             "歌词解绑",
             "歌词解绑QQ",
             "歌词解绑qq",
+            "/歌词猜曲解绑",
+            "/pjsk歌词猜曲解绑",
+            "/歌词猜曲解绑QQ",
+            "/歌词猜曲解绑qq",
+            "/pjsk歌词猜曲解绑QQ",
+            "/pjsk歌词猜曲解绑qq",
+            "/猜歌词解绑",
+            "/猜歌词解绑QQ",
+            "/猜歌词解绑qq",
+            "/歌词识曲解绑",
+            "/歌词识曲解绑QQ",
+            "/歌词识曲解绑qq",
+            "/歌词猜歌解绑",
+            "/歌词猜歌解绑QQ",
+            "/歌词猜歌解绑qq",
+            "/歌词解绑",
+            "/歌词解绑QQ",
+            "/歌词解绑qq",
         },
     )
     async def unbind_lyrics_account(self, event: AstrMessageEvent):
@@ -2586,7 +2625,7 @@ class GuessLyricsPlugin(Star):
         else:
             yield event.plain_result("解绑失败，请稍后重试。")
 
-    @filter.command("歌词猜曲帮助")
+    @filter.command("歌词猜曲帮助", alias={"/歌词猜曲帮助"})
     async def show_help(self, event: AstrMessageEvent):
         """显示帮助信息"""
         if not self._is_group_allowed(event):
@@ -2627,7 +2666,7 @@ class GuessLyricsPlugin(Star):
         )
         yield event.plain_result(help_text)
     
-    @filter.command("刷新本地数据", alias={"重载本地数据", "刷新数据"})
+    @filter.command("刷新本地数据", alias={"重载本地数据", "刷新数据", "/刷新本地数据", "/重载本地数据", "/刷新数据"})
     async def reload_local_data(self, event: AstrMessageEvent):
         """刷新本地数据"""
         if not self._is_group_allowed(event):
@@ -2664,7 +2703,7 @@ class GuessLyricsPlugin(Star):
             logger.error(f"Failed to reload data: {e}")
             yield event.plain_result(f"刷新失败: {e}")
     
-    @filter.command("歌词猜曲分数", alias={"pjsk歌词猜曲分数", "猜歌词分数", "歌词猜曲查分", "歌词猜曲个人分数"})
+    @filter.command("歌词猜曲分数", alias={"pjsk歌词猜曲分数", "猜歌词分数", "歌词猜曲查分", "歌词猜曲个人分数", "/歌词猜曲分数", "/pjsk歌词猜曲分数", "/猜歌词分数", "/歌词猜曲查分", "/歌词猜曲个人分数"})
     async def show_user_score(self, event: AstrMessageEvent):
         """显示用户分数"""
         if not self._is_group_allowed(event):
@@ -2729,7 +2768,7 @@ class GuessLyricsPlugin(Star):
         
         yield event.plain_result(stats_text)
     
-    @filter.command("歌词猜曲排行榜", alias={"歌词猜曲排行", "pjsk歌词猜曲排行榜"})
+    @filter.command("歌词猜曲排行榜", alias={"歌词猜曲排行", "pjsk歌词猜曲排行榜", "/歌词猜曲排行榜", "/歌词猜曲排行", "/pjsk歌词猜曲排行榜"})
     async def show_ranking(self, event: AstrMessageEvent):
         """显示排行榜"""
         if not self._is_group_allowed(event):
@@ -2761,7 +2800,7 @@ class GuessLyricsPlugin(Star):
             logger.error(f"Failed to render ranking: {e}")
             yield event.plain_result("生成排行榜图片时出错。")
     
-    @filter.command("歌词猜曲自定义名称", alias={"歌词猜曲昵称", "歌词猜曲名称", "歌词猜曲起名"})
+    @filter.command("歌词猜曲自定义名称", alias={"歌词猜曲昵称", "歌词猜曲名称", "歌词猜曲起名", "/歌词猜曲自定义名称", "/歌词猜曲昵称", "/歌词猜曲名称", "/歌词猜曲起名"})
     async def set_custom_name(self, event: AstrMessageEvent):
         """设置自定义名称"""
         if not self._is_group_allowed(event):
